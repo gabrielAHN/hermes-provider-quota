@@ -1,0 +1,12 @@
+{
+  "name": "provider-quota",
+  "label": "Provider Quotas",
+  "description": "Account quota broker (OpenRouter, Claude, Codex) for your Hermes gateway",
+  "icon": "Gauge",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "slots": [],
+  "api": "plugin_api.py"
+}

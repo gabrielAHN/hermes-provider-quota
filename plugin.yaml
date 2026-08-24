@@ -1,0 +1,7 @@
+name: provider-quota
+version: 1.0.0
+description: Shared quota broker for OpenRouter, Claude, and Codex
+author: gabrielAHN
+kind: standalone
+platforms:
+  - macos
