@@ -9,8 +9,12 @@ launch_target="gui/$(id -u)"
 label="io.github.gabrielahn.provider-quotas"
 
 mkdir -p "$app_target/Contents/MacOS" "$HOME/Library/LaunchAgents" "$HOME/.hermes/logs" "$HOME/.local/bin"
-# Data source: the Hermes Desktop app's gateway API (see desktop-quotas.sh).
+# Data sources: the Hermes Desktop app's gateway API (desktop-quotas.sh), and a
+# gateway-agnostic fallback that queries each provider's usage API directly from
+# local credentials (local-quotas.sh) — so quotas show under Goose, or with no
+# gateway running, not just Hermes.
 install -m 755 "$service_home/desktop-quotas.sh" "$HOME/.local/bin/hermes-desktop-quotas"
+install -m 755 "$service_home/local-quotas.sh" "$HOME/.local/bin/hermes-local-quotas"
 xcrun swiftc -O -parse-as-library -framework AppKit "$service_home/menubar/ProviderQuotaMenuBar.swift" -o "$binary_target"
 install -m 644 "$service_home/menubar/Info.plist" "$app_target/Contents/Info.plist"
 codesign --force --sign - "$app_target" >/dev/null

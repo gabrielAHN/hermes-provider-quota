@@ -428,6 +428,11 @@ final class ActivityPetsView: NSView {
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
         guard let instance = instance(at: point) else { return "Hermes" }
+        if instance.key == "needs-login" {
+            return instance.profile == "No source"
+                ? "Nothing enabled — enable Hermes or Local"
+                : "\(instance.profile) disconnected — sign in to see quotas"
+        }
         let state = instance.sleeping ? "Sleeping" : instance.completed ? "Completed" : instance.failed ? "Error" : instance.status == "waiting" ? "Waiting for input" : "Processing"
         let title = instance.title.isEmpty ? "Hermes session" : instance.title
         return "\(instance.profile) · \(title) · \(state)"
@@ -624,14 +629,41 @@ final class ActivityPetsPanel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let menu = NSMenu()
-    private var payload: QuotaPayload?
+    // Sources: `.hermes` = the Hermes Desktop app's gateway session (via
+    // hermes-desktop-quotas); `.local` = the locally-authenticated providers on
+    // this Mac (via hermes-local-quotas). The user enables one or BOTH; when both
+    // are enabled the menu shows each source's providers together (the same
+    // provider, e.g. Claude, can appear once per source). No fallback.
+    private enum GatewayKind: String { case hermes, local }
+    // One entry per enabled source with the providers it returned (or synthetic
+    // "Disconnected" rows if that source is down).
+    private struct SourceQuota {
+        let kind: GatewayKind
+        let providers: [QuotaProvider]
+        let connected: Bool
+        let generatedAt: String?
+    }
+    private var sources: [SourceQuota] = []
     private var desktopStatus = DesktopStatus(running: false, mode: "unknown", authMode: "unknown", remoteURL: nil, signedIn: false, reachable: false, profile: nil, provider: nil, model: nil)
-    private var errorMessage: String?
     private var refreshing = false
     private var timer: Timer?
     private var authRefreshTimers: [Timer] = []
     private var signalSource: DispatchSourceSignal?
+    // Providers whose detail is expanded (collapsed by default → brief row with a
+    // bar; click to expand for per-window info). Session-scoped.
     private var expandedProviders = Set<String>()
+    // Last provider slug→label from a successful fetch, PER source, so a
+    // disconnected (or freshly-switched) source lists only its own providers, and
+    // disabling a source can drop its providers entirely.
+    private var lastProvidersByKind: [String: [(slug: String, label: String)]] = {
+        var out: [String: [(slug: String, label: String)]] = [:]
+        for kind in ["hermes", "local"] {
+            let slugs = UserDefaults.standard.stringArray(forKey: "lastProviderSlugs.\(kind)") ?? []
+            let labels = UserDefaults.standard.stringArray(forKey: "lastProviderLabels.\(kind)") ?? []
+            if !slugs.isEmpty { out[kind] = zip(slugs, labels).map { ($0, $1) } }
+        }
+        return out
+    }()
     private var activityTimer: Timer?
     private let activityPanel = ActivityPetsPanel()
     private var activityPetsEnabled: Bool = {
@@ -639,8 +671,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return defaults.object(forKey: "activityPetsEnabled") == nil || defaults.bool(forKey: "activityPetsEnabled")
     }()
 
-    private var gatewayConnected: Bool {
-        desktopStatus.connected && errorMessage == nil
+    private func sourceName(_ kind: GatewayKind) -> String {
+        kind == .local ? "Local" : "Hermes"
+    }
+
+    // Any enabled source returned data.
+    private var anyConnected: Bool {
+        sources.contains { $0.connected }
+    }
+
+    private func hermesSource() -> SourceQuota? {
+        sources.first { $0.kind == .hermes }
+    }
+
+    // Every enabled source is down (or none is enabled) — drives the "not
+    // working" pet + a sign-in prompt.
+    private var needsLogin: Bool {
+        !enabledGateways().isEmpty && !anyConnected
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -722,12 +769,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    private func titleView(_ payload: QuotaPayload?) -> NSView {
+    private func titleView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 68))
         view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold)))
-        let connection = desktopConnectionSummary()
-        view.addSubview(label(connection, frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: gatewayConnected ? .hermesGreen : .hermesRed))
-        let updated = formattedRelativeDate(payload?.generatedAt).map { "Updated \($0)" } ?? "Hermes provider quotas"
+        let connection = connectionSummary()
+        view.addSubview(label(connection, frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: anyConnected ? .hermesGreen : .hermesRed))
+        let generatedAt = sources.compactMap { $0.generatedAt }.first
+        let updated = formattedRelativeDate(generatedAt).map { "Updated \($0)" } ?? "Provider quotas"
         view.addSubview(label(updated, frame: NSRect(x: 16, y: 4, width: 300, height: 16), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
         let image = NSImageView(frame: NSRect(x: 320, y: 28, width: 22, height: 22))
         image.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Quotas")
@@ -736,39 +784,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return view
     }
 
-    private func providerView(_ provider: QuotaProvider) -> NSView {
+    // Stable per-(source,provider) key so the same provider from two sources
+    // expands independently.
+    private func providerKey(_ kind: GatewayKind, _ slug: String) -> String { "\(kind.rawValue):\(slug)" }
+
+    // Collapsed provider row: brief summary + a provider-coloured bar (overall
+    // remaining). Click toggles the expanded per-window detail. `connected` is the
+    // provider's SOURCE state (so a provider from a down source reads red even if
+    // the other source is up).
+    private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
-        let expanded = expandedProviders.contains(provider.provider)
-        let chevron = NSImageView(frame: NSRect(x: 13, y: 17, width: 12, height: 12))
+        let key = providerKey(kind, provider.provider)
+        let expanded = expandedProviders.contains(key)
+        let chevron = NSImageView(frame: NSRect(x: 13, y: 18, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
         chevron.contentTintColor = .tertiaryLabelColor
         view.addSubview(chevron)
         let symbol = providerSymbolName(provider.provider)
-        let image = NSImageView(frame: NSRect(x: 34, y: 15, width: 17, height: 17))
+        let image = NSImageView(frame: NSRect(x: 32, y: 25, width: 16, height: 16))
         image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: provider.label)
-        image.contentTintColor = gatewayConnected && provider.status == "ok" ? providerBrandColor(provider) : providerIndicatorColor(provider)
+        image.contentTintColor = connected && provider.status == "ok" ? providerBrandColor(provider) : providerIndicatorColor(provider, connected: connected)
         view.addSubview(image)
-        view.addSubview(label(provider.label, frame: NSRect(x: 60, y: 23, width: 155, height: 18), font: .systemFont(ofSize: 13, weight: .semibold)))
-        // Keep the summary text high-contrast/readable; only tint it when the
-        // provider is degraded (orange) or disconnected (red).
-        let summaryColor: NSColor = (gatewayConnected && provider.status == "ok") ? .secondaryLabelColor : providerIndicatorColor(provider)
-        view.addSubview(label(providerSummary(provider), frame: NSRect(x: 60, y: 6, width: 235, height: 16), font: .systemFont(ofSize: 10.5), color: summaryColor))
+        view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold)))
         if let plan = provider.plan {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 230, y: 25, width: 65, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 95, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
         }
-        let statusImage = NSImageView(frame: NSRect(x: 326, y: 17, width: 14, height: 14))
-        statusImage.image = providerDotImage(provider, size: 14)
+        let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
+        statusImage.image = providerDotImage(provider, size: 14, connected: connected)
         view.addSubview(statusImage)
+        // Brief line: summary text + an overall provider-coloured bar.
+        let summaryColor: NSColor = (connected && provider.status == "ok") ? .secondaryLabelColor : providerIndicatorColor(provider, connected: connected)
+        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: summaryColor))
+        if connected, provider.status == "ok", let minimum = providerMinimum(provider) {
+            let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
+            track.wantsLayer = true
+            track.layer?.cornerRadius = 3
+            track.layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.28).cgColor
+            let fillWidth = 104 * max(0, min(100, minimum)) / 100
+            let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 6))
+            fill.wantsLayer = true
+            fill.layer?.cornerRadius = 3
+            fill.layer?.backgroundColor = barColor(for: provider, remainingPercent: minimum).cgColor
+            track.addSubview(fill)
+            view.addSubview(track)
+        }
         let button = NSButton(frame: view.bounds)
         button.isBordered = false
         button.title = ""
-        button.identifier = NSUserInterfaceItemIdentifier(provider.provider)
+        button.identifier = NSUserInterfaceItemIdentifier(key)
         button.target = self
-        button.action = #selector(toggleProvider)
+        button.action = #selector(toggleProviderExpanded)
         button.toolTip = expanded ? "Collapse \(provider.label)" : "Expand \(provider.label)"
         view.addSubview(button)
         return view
     }
+
+    // Small source header shown above a source's providers when >1 source is on.
+    private func sourceHeaderView(_ source: SourceQuota) -> NSView {
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 22))
+        let dot = NSImageView(frame: NSRect(x: 16, y: 6, width: 9, height: 9))
+        dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+        dot.contentTintColor = source.connected ? .hermesGreen : .hermesRed
+        view.addSubview(dot)
+        view.addSubview(label(sourceName(source.kind).uppercased(), frame: NSRect(x: 32, y: 4, width: 200, height: 14),
+                              font: .systemFont(ofSize: 9.5, weight: .semibold), color: .secondaryLabelColor))
+        view.addSubview(label(source.connected ? "connected" : "disconnected", frame: NSRect(x: 214, y: 4, width: 128, height: 14),
+                              font: .systemFont(ofSize: 9.5), color: source.connected ? .hermesGreen : .hermesRed, alignment: .right))
+        return view
+    }
+
+    // Bar colour = the provider's brand colour, turning red only when exhausted.
+    private func barColor(for provider: QuotaProvider, remainingPercent: Double?) -> NSColor {
+        if let r = remainingPercent, r <= 0 { return .hermesRed }
+        return providerBrandColor(provider)
+    }
+
+    // Synthetic provider rows for a disconnected source — from that source's
+    // last-known provider list (or the default set if never connected).
+    private func disconnectedProviders(for kind: GatewayKind) -> [QuotaProvider] {
+        let cached = lastProvidersByKind[kind.rawValue] ?? []
+        let base = cached.isEmpty
+            ? [("openrouter", "OpenRouter"), ("anthropic", "Claude"), ("openai-codex", "Codex")]
+            : cached.map { ($0.slug, $0.label) }
+        return base.map { QuotaProvider(provider: $0.0, label: $0.1, status: "disconnected", plan: nil, windows: [], details: [], message: "Disconnected") }
+    }
+
 
     private func providerMinimum(_ provider: QuotaProvider) -> Double? {
         provider.windows.compactMap(\.remainingPercent).min()
@@ -815,13 +915,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func providerDotImage(_ provider: QuotaProvider, size: CGFloat) -> NSImage {
+    private func providerDotImage(_ provider: QuotaProvider, size: CGFloat, connected: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
         let dot = NSBezierPath(ovalIn: NSRect(x: 1.5, y: 1.5, width: size - 3, height: size - 3))
         providerBrandColor(provider).setFill()
         dot.fill()
-        let disconnected = !gatewayConnected || provider.status != "ok"
+        let disconnected = !connected || provider.status != "ok"
         let exhausted = !disconnected && providerIsExhausted(provider)
         if disconnected || exhausted {
             (disconnected ? NSColor.hermesRed : NSColor.hermesYellow).setStroke()
@@ -834,11 +934,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return image
     }
 
-    private func providerIndicatorColor(_ provider: QuotaProvider) -> NSColor {
-        guard gatewayConnected else { return .hermesRed }
-        // Hermes purple is the primary accent for a healthy provider; the
-        // provider's own brand colour survives as the small identity dot/icon.
-        // A degraded provider turns Hermes orange so it stands out.
+    private func providerIndicatorColor(_ provider: QuotaProvider, connected: Bool) -> NSColor {
+        guard connected else { return .hermesRed }
+        // Blue accent for a healthy provider; a degraded one turns orange.
         return provider.status == "ok" ? .hermesBlue : .hermesOrange
     }
 
@@ -852,8 +950,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return formatter.localizedString(for: soonest, relativeTo: Date())
     }
 
-    private func providerSummary(_ provider: QuotaProvider) -> String {
-        guard gatewayConnected else { return desktopConnectionSummary() }
+    private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
+        // Per-provider status when the source is down, rather than repeating the
+        // whole connection summary on every row.
+        guard connected else { return "Disconnected" }
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
@@ -872,23 +972,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "Quota available"
     }
 
+    // Flattened (source, provider) pairs across all enabled sources.
+    private func allEntries() -> [(kind: GatewayKind, connected: Bool, provider: QuotaProvider)] {
+        sources.flatMap { source in source.providers.map { (source.kind, source.connected, $0) } }
+    }
+
     private func statusDotsImage() -> NSImage {
-        let providers = payload?.providers ?? []
-        let count = max(providers.count, 1)
+        let entries = allEntries()
+        let count = max(entries.count, 1)
         let image = NSImage(size: NSSize(width: CGFloat(count * 15 + 2), height: 15))
         image.lockFocus()
-        if providers.isEmpty {
-            let color = gatewayConnected ? NSColor.tertiaryLabelColor : NSColor.hermesRed
+        if entries.isEmpty {
+            let color = anyConnected ? NSColor.tertiaryLabelColor : NSColor.hermesRed
             color.setStroke()
             let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 11, height: 11))
             dot.lineWidth = 2
             dot.stroke()
         }
-        for (index, provider) in providers.enumerated() {
-            let disconnected = !gatewayConnected || provider.status != "ok"
-            let exhausted = !disconnected && providerIsExhausted(provider)
+        for (index, entry) in entries.enumerated() {
+            let disconnected = !entry.connected || entry.provider.status != "ok"
+            let exhausted = !disconnected && providerIsExhausted(entry.provider)
             let dot = NSBezierPath(ovalIn: NSRect(x: CGFloat(index * 15 + 2), y: 2, width: 11, height: 11))
-            providerBrandColor(provider.provider).setFill()
+            providerBrandColor(entry.provider.provider).setFill()
             dot.fill()
             if disconnected || exhausted {
                 (disconnected ? NSColor.hermesRed : NSColor.hermesYellow).setStroke()
@@ -902,32 +1007,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func statusTooltip() -> String {
-        guard gatewayConnected else { return desktopConnectionSummary() }
-        guard let providers = payload?.providers, !providers.isEmpty else {
+        let entries = allEntries()
+        guard !entries.isEmpty else {
+            if needsLogin || enabledGateways().isEmpty { return connectionSummary() }
             return refreshing ? "Loading provider quotas" : "Provider quotas unavailable"
         }
-        let providerText = providers.map { "\($0.label): \(providerSummary($0))" }.joined(separator: " · ")
-        return "\(desktopConnectionSummary()) · \(providerText)"
+        let multi = sources.count > 1
+        let providerText = entries.map { e in
+            let prefix = multi ? "\(sourceName(e.kind)) " : ""
+            return "\(prefix)\(e.provider.label): \(providerSummary(e.provider, connected: e.connected))"
+        }.joined(separator: " · ")
+        return "\(connectionSummary()) · \(providerText)"
     }
 
-    private func desktopConnectionSummary() -> String {
-        if !desktopStatus.signedIn { return "Hermes Desktop sign-in required" }
-        if !desktopStatus.reachable { return "Hermes Desktop gateway unavailable" }
-        if errorMessage != nil { return "Hermes Desktop gateway authentication unavailable" }
-        let profile = desktopStatus.profile.map { " · \($0)" } ?? ""
-        let state = desktopStatus.running ? "connected" : "signed in"
-        return "Hermes Desktop \(state)\(profile)"
+    // One-liner for the header / tooltips summarising the enabled sources.
+    private func connectionSummary() -> String {
+        let enabled = enabledGateways()
+        if enabled.isEmpty { return "Nothing enabled — enable Hermes or Local" }
+        if needsLogin {
+            let names = enabled.map { sourceName($0) }.joined(separator: " and ")
+            return "Sign in to \(names) to see quotas"
+        }
+        // Per-source status, e.g. "Hermes connected · Local disconnected".
+        return enabled.map { kind in
+            let connected = sources.first { $0.kind == kind }?.connected ?? false
+            return "\(sourceName(kind)) \(connected ? "connected" : "disconnected")"
+        }.joined(separator: " · ")
     }
 
     private func windowView(_ window: QuotaWindow, provider: QuotaProvider) -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 66))
         let value = window.remainingPercent ?? 0
         let hasValue = window.remainingPercent != nil || window.remainingAmount != nil
-        // The progress bar carries the Hermes-blue accent; the value TEXT stays
-        // high-contrast (label colour) for readability. Low quota warms both to
-        // orange so it stands out.
+        // The progress bar carries the PROVIDER's brand colour (red when
+        // exhausted); the value TEXT stays high-contrast, warming to orange when
+        // the quota is low so it stands out.
         let low = window.remainingPercent.map { $0 <= 15 } ?? false
-        let barColor = hasValue ? (low ? NSColor.hermesOrange : NSColor.hermesBlue) : NSColor.tertiaryLabelColor
+        let bar = hasValue ? barColor(for: provider, remainingPercent: window.remainingPercent) : NSColor.tertiaryLabelColor
         let valueColor: NSColor = hasValue ? (low ? NSColor.hermesOrange : NSColor.labelColor) : NSColor.tertiaryLabelColor
         view.addSubview(label(window.label, frame: NSRect(x: 28, y: 40, width: 170, height: 18), font: .systemFont(ofSize: 12, weight: .medium)))
         let displayValue: String
@@ -948,7 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let fill = NSView(frame: NSRect(x: 0, y: 0, width: fillWidth, height: 6))
             fill.wantsLayer = true
             fill.layer?.cornerRadius = 3
-            fill.layer?.backgroundColor = barColor.cgColor
+            fill.layer?.backgroundColor = bar.cgColor
             track.addSubview(fill)
             view.addSubview(track)
         }
@@ -1000,6 +1116,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.setAccessibilityLabel(label)
         button.glowColor = glowColor
         return button
+    }
+
+    // The sources are configured by the user: two enable chips — Hermes (the
+    // gateway) and Local (locally-authenticated providers) — both OFF by default.
+    // Enable one or BOTH; when both are on, both sources' providers are shown
+    // together. No fallback. Disabling a chip drops that source's providers.
+    private func gatewayRowView() -> NSView {
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
+        let enabled = enabledGateways()
+        let icon = NSImageView(frame: NSRect(x: 16, y: 12, width: 16, height: 16))
+        icon.image = NSImage(systemSymbolName: "network", accessibilityDescription: nil)
+        icon.contentTintColor = enabled.isEmpty ? .tertiaryLabelColor : (anyConnected ? .hermesBlue : .hermesRed)
+        view.addSubview(icon)
+
+        view.addSubview(label("Sources", frame: NSRect(x: 42, y: 12, width: 150, height: 16),
+                              font: .systemFont(ofSize: 12, weight: .medium)))
+
+        // Per-source enable chips (independent on/off; enable both to see both).
+        for (kind, cx) in [(GatewayKind.hermes, CGFloat(210)), (GatewayKind.local, CGFloat(278))] {
+            let name = sourceName(kind)
+            let on = gatewayEnabled(kind)
+            let connected = sources.first { $0.kind == kind }?.connected ?? false
+            let glow: NSColor = !on ? .disabledControlTextColor : (connected ? .hermesGreen : .hermesRed)
+            let chip = textActionButton(name, action: #selector(toggleGatewayEnabled(_:)), glowColor: glow)
+            chip.frame = NSRect(x: cx, y: 7, width: 64, height: 26)
+            chip.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
+            chip.alphaValue = on ? 1.0 : 0.55
+            chip.toolTip = on ? "Disable \(name) (removes its providers)" : "Enable \(name)"
+            view.addSubview(chip)
+        }
+        return view
     }
 
     // Clickable row (shown when pets are on) that displays the current pet and,
@@ -1054,14 +1201,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(refresh)
         x += 34
 
-        // 2) Open Hermes.
-        let appPath = NSHomeDirectory() + "/Applications/Hermes.app"
-        let appIcon = NSWorkspace.shared.icon(forFile: appPath).copy() as? NSImage
-        appIcon?.size = NSSize(width: 16, height: 16)
-        let hermes = iconActionButton(appIcon, label: "Open Hermes", action: #selector(openHermes), glowColor: .hermesBlue)
-        hermes.frame = NSRect(x: x, y: 7, width: 28, height: 28)
-        view.addSubview(hermes)
-        x += 34
+        // 2) Open the Hermes app — only when Hermes is enabled and installed.
+        if gatewayEnabled(.hermes), let appPath = gatewayAppURL()?.path {
+            let appIcon = (NSWorkspace.shared.icon(forFile: appPath).copy() as? NSImage)
+            appIcon?.size = NSSize(width: 16, height: 16)
+            let openBtn = iconActionButton(appIcon, label: "Open Hermes", action: #selector(openGateway), glowColor: .hermesBlue)
+            openBtn.frame = NSRect(x: x, y: 7, width: 28, height: 28)
+            view.addSubview(openBtn)
+            x += 34
+        }
 
         // 3) Activity pets on/off — a glowing chip matching the other buttons:
         // blue glow when on, dim grey when off.
@@ -1074,22 +1222,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(petsBtn)
         x += 34
 
-        // 4) Sign in / out — rare (only when the gateway session expires).
-        if desktopStatus.authMode == "oauth", desktopStatus.remoteURL != nil {
-            let login = textActionButton("Login", action: #selector(signInGateway), glowColor: .hermesGreen)
-            login.frame = NSRect(x: x, y: 7, width: 54, height: 28)
-            login.toolTip = desktopStatus.signedIn ? "Sign in again to Hermes Gateway" : "Sign in to Hermes Gateway"
-            view.addSubview(login)
-            x += 60
-            if desktopStatus.signedIn {
+        // 4) Login / Logout for the Hermes gateway session (Hermes has one;
+        // Local providers authenticate via their own CLIs). Logout when the Hermes
+        // source is connected, Login when it isn't.
+        if gatewayEnabled(.hermes) {
+            if hermesSource()?.connected == true {
                 let logout = textActionButton("Logout", action: #selector(signOutGateway), glowColor: .hermesRed)
-                logout.frame = NSRect(x: x, y: 7, width: 60, height: 28)
-                logout.toolTip = "Sign out of Hermes Gateway"
+                logout.frame = NSRect(x: x, y: 7, width: 70, height: 28)
+                logout.toolTip = "Log out of the Hermes gateway"
                 view.addSubview(logout)
+                x += 76
+            } else {
+                let login = textActionButton("Login", action: #selector(signInGateway), glowColor: .hermesGreen)
+                login.frame = NSRect(x: x, y: 7, width: 70, height: 28)
+                login.toolTip = "Log in to the Hermes gateway"
+                view.addSubview(login)
+                x += 76
             }
         }
 
-        // 5) Close — least used / destructive, pinned far right.
+        // 5) Setup — configure the Hermes gateway (opens its Desktop gateway page).
+        // Shown whenever Hermes is enabled, so you can point/repair the gateway.
+        if gatewayEnabled(.hermes) {
+            let setup = iconActionButton(NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil), label: "Set up Hermes gateway", action: #selector(openGatewaySetup), glowColor: .hermesBlue)
+            setup.frame = NSRect(x: x, y: 7, width: 28, height: 28)
+            setup.toolTip = "Set up the Hermes gateway (opens the Hermes Desktop gateway page)"
+            view.addSubview(setup)
+            x += 34
+        }
+
+        // 6) Close — least used / destructive, pinned far right.
         let close = iconActionButton(NSImage(systemSymbolName: "xmark", accessibilityDescription: nil), label: "Close Provider Quotas", action: #selector(quit), glowColor: .hermesRed)
         close.frame = NSRect(x: 314, y: 7, width: 28, height: 28)
         view.addSubview(close)
@@ -1099,11 +1261,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         // No separators / divider lines — the sections are seamless.
         menu.removeAllItems()
-        addView(titleView(payload))
-        if let payload {
-            for provider in payload.providers {
-                addView(providerView(provider))
-                if expandedProviders.contains(provider.provider) {
+        addView(titleView())
+        addView(gatewayRowView())
+        if sources.isEmpty {
+            let message = enabledGateways().isEmpty
+                ? "Enable Hermes or Local above"
+                : (refreshing ? "Loading quotas…" : "Quota data unavailable")
+            addView(messageView(message))
+        } else {
+            // One block per enabled source. With more than one source, a small
+            // header labels each so the same provider from each is distinct.
+            let showHeaders = sources.count > 1
+            for source in sources {
+                if showHeaders { addView(sourceHeaderView(source)) }
+                for provider in source.providers {
+                    addView(providerView(provider, kind: source.kind, connected: source.connected))
+                    // Collapsed by default; expand to see per-window detail.
+                    guard expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
                     if provider.windows.isEmpty {
                         addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
                     }
@@ -1115,12 +1289,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 }
             }
-        } else {
-            let message = refreshing && errorMessage == nil ? "Loading quotas…" : "Quota data unavailable"
-            addView(messageView(message))
-        }
-        if let errorMessage {
-            addView(messageView(errorMessage, color: .hermesRed))
         }
         // When pets are on, a clickable row shows the current pet and cycles
         // through the other installed pets on click.
@@ -1189,6 +1357,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func togglePetsButton() {
         setActivityPets(!activityPetsEnabled)
+    }
+
+    // Enable / disable a single source. sender.identifier is the kind's rawValue.
+    @objc private func toggleGatewayEnabled(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
+        let nowOn = !gatewayEnabled(kind)
+        setGatewayEnabled(kind, nowOn)
+        if !nowOn {
+            // Disabling a source removes ALL of its providers: drop it from the
+            // live list AND its cached copy so nothing linked to it lingers.
+            sources.removeAll { $0.kind == kind }
+            lastProvidersByKind[kind.rawValue] = nil
+            UserDefaults.standard.removeObject(forKey: "lastProviderSlugs.\(kind.rawValue)")
+            UserDefaults.standard.removeObject(forKey: "lastProviderLabels.\(kind.rawValue)")
+        }
+        reloadAfterGatewayChange()
+    }
+
+    private func reloadAfterGatewayChange() {
+        updateStatusItem()
+        rebuildMenu()
+        refresh()
+        refreshActivityPets()
     }
 
     // Pull pets that were downloaded on the gateway (remote Desktop installs them
@@ -1272,14 +1463,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let fallbackProfile = desktopStatus.profile ?? "Hermes"
+        // Captured on the main thread. When every enabled source is disconnected
+        // (or none is enabled) the pet shows a "not working" state.
+        let disconnected = needsLogin
+        let enabled = enabledGateways()
+        let kindName = enabled.isEmpty ? "No source" : enabled.map { sourceName($0) }.joined(separator: " / ")
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let fetched = Self.fetchProviderActivity()
-            let instances = fetched.isEmpty ? [Self.sleepingPlaceholder(profile: fallbackProfile)] : fetched
             DispatchQueue.main.async {
                 guard let self else { return }
+                let instances: [ProviderActivityInstance]
+                if disconnected {
+                    instances = [Self.needsLoginPlaceholder(gateway: kindName)]
+                } else if fetched.isEmpty {
+                    instances = [Self.sleepingPlaceholder(profile: fallbackProfile)]
+                } else {
+                    instances = fetched
+                }
                 self.activityPanel.show(instances)
             }
         }
+    }
+
+    // A "not working" pet: the error/struggling animation + red halo + "!" badge
+    // (drawPet/drawNukey render status "failed" that way), signalling the active
+    // gateway is disconnected and needs a sign-in.
+    private static func needsLoginPlaceholder(gateway: String) -> ProviderActivityInstance {
+        ProviderActivityInstance(
+            completedAt: nil,
+            key: "needs-login",
+            model: "",
+            profile: gateway,
+            provider: "provider",
+            providerColor: "#cf2d56",
+            providerLabel: "",
+            sessionId: "",
+            startedAt: Date().timeIntervalSince1970,
+            status: "failed",
+            title: "Sign in"
+        )
     }
 
     private static func sleepingPlaceholder(profile: String) -> ProviderActivityInstance {
@@ -1329,7 +1551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func toggleProvider(_ sender: NSButton) {
+    @objc private func toggleProviderExpanded(_ sender: NSButton) {
         guard let provider = sender.identifier?.rawValue else { return }
         if expandedProviders.contains(provider) {
             expandedProviders.remove(provider)
@@ -1344,39 +1566,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshing = true
         updateStatusItem()
         rebuildMenu()
+        let kinds = enabledGateways()   // fetch EVERY enabled source
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let desktop = Self.fetchDesktopStatus()
-            let result = Self.fetchPayload()
+            let results: [(kind: GatewayKind, result: Result<QuotaPayload, Error>)] =
+                kinds.map { ($0, Self.fetchPayload(kind: $0)) }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.refreshing = false
                 self.desktopStatus = desktop
-                switch result {
-                case .success(let payload):
-                    self.payload = payload
-                    self.errorMessage = nil
-                case .failure(let error):
-                    // Desktop-only: when its session/API isn't available, show
-                    // that — never leave stale numbers from a previous fetch.
-                    self.payload = nil
-                    self.errorMessage = error.localizedDescription
+                var built: [SourceQuota] = []
+                for (kind, result) in results {
+                    switch result {
+                    case .success(let payload):
+                        built.append(SourceQuota(kind: kind, providers: payload.providers, connected: true, generatedAt: payload.generatedAt))
+                        // Remember this source's provider list for a later disconnect.
+                        self.lastProvidersByKind[kind.rawValue] = payload.providers.map { ($0.provider, $0.label) }
+                        UserDefaults.standard.set(payload.providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
+                        UserDefaults.standard.set(payload.providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
+                    case .failure:
+                        // Source down → list its known providers as Disconnected.
+                        built.append(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
+                    }
                 }
+                self.sources = built
                 self.updateStatusItem()
                 self.rebuildMenu()
             }
         }
     }
 
-    private static func fetchPayload() -> Result<QuotaPayload, Error> {
+    // Fetch from the user's active source only — no cross-fallback. Hermes goes
+    // through the Desktop gateway session; Local reads the providers directly from
+    // this Mac's credentials. If that source is unavailable we return a failure so
+    // the app shows the pet + a sign-in prompt rather than
+    // substituting the other gateway's providers.
+    private static func fetchPayload(kind: GatewayKind) -> Result<QuotaPayload, Error> {
+        let helper = kind == .local ? "hermes-local-quotas" : "hermes-desktop-quotas"
+        let result = runHelper(helper)
+        if case .success(let payload) = result, payload.providers.isEmpty {
+            let msg = kind == .local ? "Sign in to your local providers to see quotas" : "Sign in to Hermes to see quotas"
+            return .failure(NSError(domain: "ProviderQuotaMenuBar", code: 1, userInfo: [NSLocalizedDescriptionKey: msg]))
+        }
+        return result
+    }
+
+    private static func runHelper(_ name: String) -> Result<QuotaPayload, Error> {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
-        // Fetch through the Hermes Desktop app's API: the helper hits the same
-        // gateway endpoint the Desktop's Provider Quotas page uses, with the
-        // Desktop's OAuth session (falling back to the same gateway broker when
-        // that session is idle-stale). Represents THIS instance's Hermes.
         let helper = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+            .appendingPathComponent(".local/bin/\(name)").path
+        guard FileManager.default.isExecutableFile(atPath: helper) else {
+            return .failure(NSError(domain: "ProviderQuotaMenuBar", code: 127, userInfo: [NSLocalizedDescriptionKey: "\(name) is not installed"]))
+        }
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = ["-lc", "exec \"$0\"", helper]
         process.standardOutput = output
@@ -1387,7 +1630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let data = output.fileHandleForReading.readDataToEndOfFile()
             if process.terminationStatus != 0 {
                 let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-                let message = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Hermes Desktop request failed"
+                let message = String(data: errorData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "\(name) request failed"
                 throw NSError(domain: "ProviderQuotaMenuBar", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message])
             }
             return .success(try JSONDecoder().decode(QuotaPayload.self, from: data))
@@ -1506,6 +1749,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Hermes.app"), configuration: NSWorkspace.OpenConfiguration())
     }
 
+    // The Hermes app to launch / sign into ("local" has no app).
+    private func gatewayAppURL() -> URL? {
+        let hermes = URL(fileURLWithPath: NSHomeDirectory() + "/Applications/Hermes.app")
+        return FileManager.default.fileExists(atPath: hermes.path) ? hermes
+            : NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.nousresearch.hermes")
+    }
+
+    // Sources are configured by the user, per source — nothing is hardcoded or
+    // assumed present. Both default OFF; you enable Hermes and/or Local in the
+    // menu and the app uses ALL the enabled ones.
+    private func gatewayEnabled(_ kind: GatewayKind) -> Bool {
+        UserDefaults.standard.bool(forKey: "gatewayEnabled.\(kind.rawValue)")
+    }
+
+    private func setGatewayEnabled(_ kind: GatewayKind, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "gatewayEnabled.\(kind.rawValue)")
+    }
+
+    private func enabledGateways() -> [GatewayKind] {
+        [.hermes, .local].filter { gatewayEnabled($0) }
+    }
+
+    @objc private func openGateway() {
+        guard let url = gatewayAppURL() else { return }
+        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    // Route to the Hermes Desktop gateway page to set up / repair the gateway.
+    // Prefer the Desktop app's gateway settings deep link (Hermes is the handler
+    // for hermes://), falling back to opening the app.
+    @objc private func openGatewaySetup() {
+        if let url = URL(string: "hermes://settings/gateway"),
+           NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            NSWorkspace.shared.open(url)
+        } else {
+            openHermes()
+        }
+    }
+
     private func openHermesSession(_ instance: ProviderActivityInstance) {
         guard !instance.sessionId.isEmpty else {
             openHermes()
@@ -1539,17 +1821,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // Sign in / out of the Hermes gateway via its OAuth deep-links. A local
+    // Hermes backend with no remote URL just opens the app to sign in.
     @objc private func signInGateway() {
-        guard let url = gatewayAuthURL(action: "login") else { return }
+        guard let url = gatewayAuthURL(action: "login") else {
+            openGateway()
+            return
+        }
         NSWorkspace.shared.open(url)
         scheduleAuthRefresh()
     }
 
     @objc private func signOutGateway() {
-        guard let url = gatewayAuthURL(action: "logout") else { return }
+        guard let url = gatewayAuthURL(action: "logout") else {
+            openGateway()
+            return
+        }
         NSWorkspace.shared.open(url)
-        payload = nil
-        errorMessage = "Hermes Desktop sign-in required"
+        sources.removeAll { $0.kind == .hermes }
         updateStatusItem()
         rebuildMenu()
         scheduleAuthRefresh()

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import socket
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -14,11 +17,46 @@ from agent.account_usage import fetch_account_usage
 
 router = APIRouter()
 
-PROVIDERS = (
-    ("openrouter", "OpenRouter"),
-    ("anthropic", "Claude"),
-    ("openai-codex", "Codex"),
-)
+# Nice labels for the providers Hermes ships account-usage support for. Any other
+# slug still works — it just gets a title-cased label.
+_KNOWN_LABELS = {
+    "openrouter": "OpenRouter",
+    "anthropic": "Claude",
+    "openai-codex": "Codex",
+}
+_DEFAULT_PROVIDERS = "openrouter,anthropic,openai-codex"
+
+
+def _label_for(slug: str) -> str:
+    return _KNOWN_LABELS.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+
+def _configured_providers() -> tuple[tuple[str, str], ...]:
+    """Which providers this gateway's dashboard reports on.
+
+    Configurable per gateway via the ``PROVIDER_QUOTA_PROVIDERS`` env var
+    (comma-separated ``slug`` or ``slug=Label`` items), so anyone can reuse this
+    plugin with their own gateway's provider set instead of a hardcoded list.
+    Defaults to the providers Hermes ships usage support for. Whatever the set,
+    every quota is read through this gateway's own ``account_usage`` credentials,
+    so the plugin stays linked to the gateway it's installed in.
+    """
+    raw = os.environ.get("PROVIDER_QUOTA_PROVIDERS", "").strip() or _DEFAULT_PROVIDERS
+    providers: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        slug, sep, label = item.partition("=")
+        slug = slug.strip()
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        providers.append((slug, label.strip() if sep and label.strip() else _label_for(slug)))
+    return tuple(providers)
+
+
 CACHE_SECONDS = 60
 _cache: dict[str, Any] | None = None
 _cache_at = 0.0
@@ -31,7 +69,102 @@ def _iso(value: datetime | None) -> str | None:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _file_anthropic_token() -> str | None:
+    """Resolve the gateway's `claude login` OAuth token from the credentials FILE
+    (refreshing if needed). On macOS, Hermes' account_usage reads the login
+    Keychain first, whose Claude session can be expired even though the file token
+    (kept fresh by the ACP bridge) is valid — that's why Claude can read as
+    "authentication required" on the gateway despite a working `claude` login.
+    Reading the file directly sidesteps that, and stays linked to the gateway's
+    own subscription."""
+    try:
+        from agent.anthropic_adapter import (
+            _read_claude_code_credentials_from_file,
+            _refresh_oauth_token,
+            is_claude_code_token_valid,
+        )
+        creds = _read_claude_code_credentials_from_file()
+        if not creds:
+            return None
+        if is_claude_code_token_valid(creds):
+            return (creds.get("accessToken") or "").strip() or None
+        return (_refresh_oauth_token(creds) or "").strip() or None
+    except Exception:
+        return None
+
+
+def _anthropic_direct(label: str) -> dict[str, Any] | None:
+    """Query the Anthropic OAuth usage API with the gateway's file token, used as
+    a fallback when account_usage can't (stale login-Keychain session). Mirrors
+    account_usage's anthropic window mapping."""
+    token = _file_anthropic_token()
+    if not token or not token.startswith("sk-ant-oat"):
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "anthropic-beta": "oauth-2025-04-20",
+                "User-Agent": "claude-code/2.1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.load(resp) or {}
+    except Exception:
+        return None
+    windows = []
+    for key, wlabel in (
+        ("five_hour", "Current session"),
+        ("seven_day", "Current week"),
+        ("seven_day_opus", "Opus week"),
+        ("seven_day_sonnet", "Sonnet week"),
+    ):
+        window = payload.get(key) or {}
+        util = window.get("utilization")
+        if util is None:
+            continue
+        used = float(util) * 100 if float(util) <= 1 else float(util)
+        used = max(0.0, min(100.0, used))
+        windows.append({
+            "label": wlabel,
+            "used_percent": used,
+            "remaining_percent": 100.0 - used,
+            "remaining_amount": None,
+            "currency": None,
+            "resets_at": window.get("resets_at"),
+            "detail": None,
+            "warning": used >= 85.0,
+        })
+    if not windows:
+        return None
+    return {
+        "provider": "anthropic",
+        "label": label,
+        "status": "ok",
+        "source": "oauth_usage_api (file token)",
+        "plan": None,
+        "fetched_at": _iso(datetime.now(timezone.utc)),
+        "windows": windows,
+        "details": [],
+        "message": None,
+    }
+
+
 def _provider(provider: str, label: str) -> dict[str, Any]:
+    result = _provider_via_account_usage(provider, label)
+    # Claude on a gateway whose login-Keychain session is stale reads as
+    # authentication_required even though the `claude login` file token works —
+    # fall back to querying usage with that file token so it still shows.
+    if provider == "anthropic" and result.get("status") != "ok":
+        fallback = _anthropic_direct(label)
+        if fallback is not None:
+            return fallback
+    return result
+
+
+def _provider_via_account_usage(provider: str, label: str) -> dict[str, Any]:
     snapshot = fetch_account_usage(provider)
     if snapshot is None:
         return {
@@ -43,12 +176,10 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
             "fetched_at": None,
             "windows": [],
             "details": [],
-            "message": f"Sign in to {label} on the Mac mini Hermes gateway.",
+            "message": f"Sign in to {label} on the gateway.",
         }
     windows = []
     for window in snapshot.windows:
-        if provider == "openrouter" and window.label != "Account credits":
-            continue
         used = None if window.used_percent is None else max(0.0, min(100.0, float(window.used_percent)))
         remaining_amount = getattr(window, "remaining_amount", None)
         remaining_amount = None if remaining_amount is None else max(0.0, float(remaining_amount))
@@ -76,6 +207,31 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
                 or (remaining_amount is not None and remaining_amount <= 0.0),
             }
         )
+    details = list(snapshot.details)
+    if provider == "openrouter":
+        # Surface the OpenRouter credit balance instead of a bare "ok". account_usage
+        # only reports it as a "Credits balance: $N" detail string (from the gateway's
+        # own credentials — respecting the gateway's access), so lift the number into
+        # an "Account credits" window the renderer can show, and drop the now-duplicate
+        # detail line while keeping the rest (e.g. "API key usage: …").
+        balance = None
+        for line in details:
+            match = re.search(r"Credits balance:\s*\$([0-9]+(?:\.[0-9]+)?)", line)
+            if match:
+                balance = float(match.group(1))
+                break
+        if balance is not None:
+            details = [d for d in details if not d.startswith("Credits balance:")]
+            windows.insert(0, {
+                "label": "Account credits",
+                "used_percent": None,
+                "remaining_percent": None,
+                "remaining_amount": balance,
+                "currency": "USD",
+                "resets_at": None,
+                "detail": f"${balance:.2f} available",
+                "warning": balance <= 0.0,
+            })
     status = "ok" if snapshot.available else "unavailable"
     return {
         "provider": provider,
@@ -85,7 +241,7 @@ def _provider(provider: str, label: str) -> dict[str, Any]:
         "plan": snapshot.plan,
         "fetched_at": _iso(snapshot.fetched_at),
         "windows": windows,
-        "details": [] if provider == "openrouter" else list(snapshot.details),
+        "details": details,
         "message": snapshot.unavailable_reason,
     }
 
@@ -96,8 +252,11 @@ def _load(refresh: bool) -> dict[str, Any]:
     with _lock:
         if not refresh and _cache is not None and now - _cache_at < CACHE_SECONDS:
             return _cache
-        providers = [_provider(provider, label) for provider, label in PROVIDERS]
+        configured = _configured_providers()
+        providers = [_provider(slug, label) for slug, label in configured]
         _cache = {
+            # broker identifies the gateway host these quotas belong to, so a
+            # client can tell which gateway it's linked to.
             "broker": socket.gethostname(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "cache_seconds": CACHE_SECONDS,
