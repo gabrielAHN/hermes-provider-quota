@@ -1,7 +1,13 @@
 name: provider-quota
 version: 1.0.0
-description: Shared quota broker for OpenRouter, Claude, and Codex
+description: Account-quota broker for your gateway's providers (defaults to OpenRouter, Claude, Codex)
 author: gabrielAHN
 kind: standalone
 platforms:
   - macos
+# The provider set is configurable per gateway via the PROVIDER_QUOTA_PROVIDERS
+# env var (comma-separated "slug" or "slug=Label"); all quotas are read through
+# the host gateway's own account_usage credentials. See README.
+config:
+  env:
+    - PROVIDER_QUOTA_PROVIDERS
