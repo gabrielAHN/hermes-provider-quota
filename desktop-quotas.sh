@@ -88,8 +88,14 @@ else:
 if not kind:
     fail("Hermes Desktop is not set up.")
 
-# --- Local backend: hit the loopback gateway the Desktop runs (a loopback bind
-# needs no auth), discovered from backend-ownership.json. ---
+def _norm(value):
+    return value.strip().strip("/")
+
+
+# --- Build a `fetch(path) -> (status, body)` bound to the gateway the Desktop is
+# bound to: a loopback bind (local mode) needs no auth; a remote gateway uses the
+# Desktop's OAuth session. Resolving this once lets one process serve several
+# endpoints (see --activity) with a single Keychain read / token decrypt. ---
 if kind == "local":
     own = read_json("backend-ownership.json") or {}
     local_url = None
@@ -104,69 +110,103 @@ if kind == "local":
             break
     if not local_url:
         fail("Hermes Desktop is in local mode but no local gateway is running.")
-    status, body = http_get(local_url + ENDPOINT, {"Accept": "*/*"})
-    if status == 200:
-        emit(body)
-        sys.exit(0)
-    fail("Local Hermes gateway returned HTTP %s." % status)
 
-# --- Remote gateway: authenticate with the Desktop's OAuth session. ---
-if not url:
-    fail("Hermes Desktop has no gateway configured.")
+    def fetch(path):
+        return http_get(local_url + path, {"Accept": "*/*"})
 
-tokens = read_json("native-oauth-tokens.json")
-if tokens is None:
-    fail("Sign in to Hermes Desktop.")
-
-
-def _norm(value):
-    return value.strip().strip("/")
-
-
-entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
-if not entry:
-    fail("Sign in to Hermes Desktop (%s)." % url)
-
-value = entry.get("value") or ""
-if entry.get("encoding") == "safeStorage":
-    # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
-    # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
-    # python crypto dependency.
-    try:
-        secret = subprocess.check_output(
-            ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception as exc:
-        fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
-    key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
-    raw = base64.b64decode(value)
-    if raw[:3] != b"v10":
-        fail("Unexpected Hermes Desktop token format.")
-    proc = subprocess.run(
-        ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
-         "-iv", "20" * 16, "-nopad"],
-        input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-    plaintext = proc.stdout
-    if not plaintext:
-        fail("Cannot decrypt Hermes Desktop session token (openssl).")
-    plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
-    session = json.loads(plaintext.decode())
+    EXPIRED_MSG = "Local Hermes gateway returned HTTP %s."
 else:
-    session = json.loads(value)
+    if not url:
+        fail("Hermes Desktop has no gateway configured.")
+    tokens = read_json("native-oauth-tokens.json")
+    if tokens is None:
+        fail("Sign in to Hermes Desktop.")
+    entry = tokens.get(url) or next((v for k, v in tokens.items() if _norm(k) == _norm(url)), None)
+    if not entry:
+        fail("Sign in to Hermes Desktop (%s)." % url)
 
-access_token = session.get("accessToken") or ""
-if not access_token:
-    fail("Sign in to Hermes Desktop.")
+    value = entry.get("value") or ""
+    if entry.get("encoding") == "safeStorage":
+        # Electron safeStorage v10: AES-128-CBC, key = PBKDF2-HMAC-SHA1(secret,
+        # "saltysalt", 1003, 16), IV = 16 spaces. Decrypt with openssl to avoid a
+        # python crypto dependency.
+        try:
+            secret = subprocess.check_output(
+                ["security", "find-generic-password", "-s", "Hermes Safe Storage", "-w"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception as exc:
+            fail("Cannot read 'Hermes Safe Storage' Keychain key: %s" % exc)
+        key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
+        raw = base64.b64decode(value)
+        if raw[:3] != b"v10":
+            fail("Unexpected Hermes Desktop token format.")
+        proc = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-128-cbc", "-K", key.hex(),
+             "-iv", "20" * 16, "-nopad"],
+            input=raw[3:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        plaintext = proc.stdout
+        if not plaintext:
+            fail("Cannot decrypt Hermes Desktop session token (openssl).")
+        plaintext = plaintext[: -plaintext[-1]]  # strip PKCS7 padding
+        session = json.loads(plaintext.decode())
+    else:
+        session = json.loads(value)
 
-status, body = http_get(
-    url + ENDPOINT,
-    {"Authorization": "Bearer " + access_token, "Accept": "*/*"},
-)
-if status in (301, 302, 303, 307, 308, 401, 403):
+    access_token = session.get("accessToken") or ""
+    if not access_token:
+        fail("Sign in to Hermes Desktop.")
+
+    def fetch(path):
+        return http_get(url + path, {"Authorization": "Bearer " + access_token, "Accept": "*/*"})
+
+    EXPIRED_MSG = "Hermes gateway returned HTTP %s."
+
+
+def get_json(path):
+    status, body = fetch(path)
+    if status != 200:
+        return None
+    try:
+        return json.loads(body)
+    except Exception:
+        return None
+
+
+# --- Activity mode: resolve the gateway ONCE, then fetch /api/status plus each
+# profile's recent sessions in the same process, and emit a compact summary the
+# menu-bar uses to light the Hermes pet. Bot turns run as `source: cli` sessions
+# that DON'T show up in the aggregate active_agents/active_sessions counters, so
+# we return the per-session flags (is_active / ended_at / last_active) and let the
+# app decide what's "running". Never fails: a signed-out gateway just yields an
+# empty summary so the pet quietly stays idle. ---
+if ENDPOINT == "--activity":
+    st = get_json("/api/status") or {}
+    profiles = st.get("profiles") or []
+    agents = st.get("active_agents") or 0
+    status_busy = (bool(st.get("gateway_busy"))
+                   or agents > 0
+                   or (st.get("active_sessions") or 0) > 0)
+    out = []
+    for profile in profiles:
+        data = get_json("/api/sessions?profile=%s&limit=10" % profile) or {}
+        for s in (data.get("sessions") or []):
+            out.append({
+                "is_active": s.get("is_active"),
+                "ended_at": s.get("ended_at"),
+                "last_active": s.get("last_active"),
+                "billing_provider": s.get("billing_provider"),
+                "provider": s.get("provider"),
+            })
+    emit(json.dumps({"agents": agents, "status_busy": status_busy, "sessions": out}).encode())
+    sys.exit(0)
+
+# --- Normal single-endpoint mode. ---
+status, body = fetch(ENDPOINT)
+if kind != "local" and status in (301, 302, 303, 307, 308, 401, 403):
     fail("Hermes Desktop session expired — open Hermes Desktop to refresh.")
 if status != 200:
-    fail("Hermes gateway returned HTTP %s." % status)
+    fail(EXPIRED_MSG % status)
 emit(body)
 PY
