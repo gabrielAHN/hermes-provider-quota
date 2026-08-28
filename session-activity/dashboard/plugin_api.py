@@ -116,22 +116,50 @@ def _models_for(home: Path, sids: set[str]) -> dict[str, tuple[str, str]]:
     return out
 
 
+# A registry lease counts as "running" only if its session logged activity this
+# recently. A desktop lease is held by the always-alive dashboard pid, so the
+# gateway never prunes it — it lingers for HOURS after the Desktop chat closed.
+# A genuinely running turn writes agent.log every few seconds (reasoning gaps
+# aside), so this window drops those stale/phantom leases while keeping live and
+# just-finished turns.
+_LEASE_ACTIVE_WINDOW = 120.0
+
+
+def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -> set[str]:
+    if not sids:
+        return set()
+    recent: set[str] = set()
+    for name in ("agent.log", "gui.log"):
+        for line in _tail_text(home / "logs" / name).splitlines():
+            ts = _log_ts(line)
+            if ts is None or now - ts > window:
+                continue
+            for sid in sids:
+                if sid not in recent and sid in line:
+                    recent.add(sid)
+        if recent == sids:
+            break
+    return recent
+
+
 @router.get("/activity")
 def activity() -> dict[str, Any]:
     now = time.time()
     home = _hermes_home()
-    sessions: dict[str, dict[str, Any]] = {}
-    try:
-        sessions.update(_active_tui_sessions(home, now))
-    except Exception:
-        pass
-    try:
-        sessions.update(_registry_sessions(home))  # desktop leases (also live)
-    except Exception:
-        pass
-    models = _models_for(home, set(sessions))
+    # In-flight tui turns (latest gui.log event is a prompt-accepted, not a
+    # turn-finished) are running by definition.
+    tui = _active_tui_sessions(home, now)
+    # Desktop leases are candidates — but only "running" with RECENT log activity,
+    # so a stale lease the gateway never released is dropped (the phantom session).
+    leases = _registry_sessions(home)
+    lease_recent = _recent_session_ids(home, set(leases) - set(tui), _LEASE_ACTIVE_WINDOW, now)
+    active: dict[str, dict[str, Any]] = dict(tui)
+    for sid, info in leases.items():
+        if sid in tui or sid in lease_recent:
+            active[sid] = info
+    models = _models_for(home, set(active))
     out = []
-    for sid, info in sessions.items():
+    for sid, info in active.items():
         model, provider = models.get(sid, ("", ""))
         out.append({
             "session_id": sid,
