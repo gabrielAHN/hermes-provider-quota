@@ -12,6 +12,10 @@
 #               chatgpt_codex/tokens.json → chatgpt.com/backend-api/wham/usage
 #   • OpenRouter — OPENROUTER_API_KEY from the env or ~/.hermes/.env
 #               → openrouter.ai/api/v1/credits
+#   • opencode — the OpenRouter key opencode itself authenticated with
+#               (~/.local/share/opencode/auth.json) → the same credits API,
+#               shown as its own row so it reads like the Hermes source's
+#               OpenRouter entry
 #
 # Portable: system python3 + security(1) only (no Hermes venv / httpx). Prints
 # the same QuotaPayload JSON the gateway plugin returns on stdout; on failure
@@ -279,30 +283,64 @@ def _openrouter_key():
     return None
 
 
-def openrouter_provider():
-    key = _openrouter_key()
-    if not key:
-        return None
+# Shared credits-API fetch: one OpenRouter-shaped row per credential holder, so
+# the env/~/.hermes key (provider "openrouter") and opencode's own key
+# (provider "opencode") each get their own row, the way the Hermes source lists
+# OpenRouter from the gateway's credentials.
+def _openrouter_credits_provider(slug, label, key, source, reject_message):
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": UA}
     try:
         credits = (_get("https://openrouter.ai/api/v1/credits", headers, timeout=10).get("data") or {})
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
-            return _provider("openrouter", "OpenRouter", "unavailable", [], message="OpenRouter key rejected — check OPENROUTER_API_KEY.")
-        return _provider("openrouter", "OpenRouter", "unavailable", [], message=f"OpenRouter error (HTTP {exc.code}).")
+            return _provider(slug, label, "unavailable", [], message=reject_message)
+        return _provider(slug, label, "unavailable", [], message=f"OpenRouter error (HTTP {exc.code}).")
     except Exception as exc:
-        return _provider("openrouter", "OpenRouter", "unavailable", [], message=f"Could not reach OpenRouter: {exc}")
+        return _provider(slug, label, "unavailable", [], message=f"Could not reach OpenRouter: {exc}")
     total = float(credits.get("total_credits") or 0.0)
     usage = float(credits.get("total_usage") or 0.0)
     remaining = max(0.0, total - usage)
     window = _window("Account credits", None, remaining_amount=remaining, currency="USD",
                      detail=f"${remaining:.2f} of ${total:.2f} left" if total > 0 else f"${remaining:.2f} available")
-    return _provider("openrouter", "OpenRouter", "ok", [window], source="credits_api")
+    return _provider(slug, label, "ok", [window], source=source)
 
 
-providers = [p for p in (anthropic_provider(), codex_provider(), openrouter_provider()) if p is not None]
+def openrouter_provider():
+    key = _openrouter_key()
+    if not key:
+        return None
+    return _openrouter_credits_provider(
+        "openrouter", "OpenRouter", key, "credits_api",
+        "OpenRouter key rejected — check OPENROUTER_API_KEY.")
+
+
+# --- opencode (OpenRouter credits through opencode's own login) ----------------
+def _opencode_key():
+    path = HOME / ".local" / "share" / "opencode" / "auth.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    entry = data.get("openrouter")
+    if not isinstance(entry, dict):
+        return None
+    return (entry.get("key") or "").strip() or None
+
+
+def opencode_provider():
+    key = _opencode_key()
+    if not key:
+        return None
+    return _openrouter_credits_provider(
+        "opencode", "opencode", key, "opencode_auth + credits_api",
+        "opencode's OpenRouter key was rejected — re-run `opencode auth login`.")
+
+
+providers = [p for p in (anthropic_provider(), codex_provider(), openrouter_provider(), opencode_provider()) if p is not None]
 if not providers:
-    fail("Sign in to Claude, Codex, or OpenRouter to see quotas.")
+    fail("Sign in to Claude, Codex, OpenRouter, or opencode to see quotas.")
 
 print(json.dumps({
     "broker": os.uname().nodename,
