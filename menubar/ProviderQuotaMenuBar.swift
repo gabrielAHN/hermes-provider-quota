@@ -11,7 +11,7 @@ struct QuotaPayload: Decodable {
     }
 }
 
-struct QuotaProvider: Decodable {
+struct QuotaProvider: Codable {
     let provider: String
     let label: String
     let status: String
@@ -21,7 +21,7 @@ struct QuotaProvider: Decodable {
     let message: String?
 }
 
-struct QuotaWindow: Decodable {
+struct QuotaWindow: Codable {
     let label: String
     let remainingPercent: Double?
     let remainingAmount: Double?
@@ -60,16 +60,6 @@ struct DesktopStatus {
 struct MenuSnapshot {
     let payload: QuotaPayload
     let desktop: DesktopStatus
-}
-
-struct ProviderActivityPayload: Decodable {
-    let updatedAt: Double
-    let instances: [ProviderActivityInstance]
-
-    enum CodingKeys: String, CodingKey {
-        case updatedAt = "updated_at"
-        case instances
-    }
 }
 
 struct ProviderActivityInstance: Decodable, Equatable {
@@ -277,6 +267,29 @@ struct PetInfo: Equatable {
     let thumbnailURL: URL?
 }
 
+// One drawn companion: a synthesized provider "activity" plus the pet art chosen
+// for that provider. Each tile carries its own pet, so every provider can have a
+// different companion shown at once.
+// One running session's mark in the pet UI: a provider-coloured dot. It's shown
+// only while the session is running and removed the moment it finishes.
+struct SessionMark: Equatable {
+    let hex: String     // provider colour
+    let busy: Bool      // actively processing (bright pulse) vs idle (dim)
+}
+
+struct PetTile: Equatable {
+    let instance: ProviderActivityInstance
+    let pet: PetInfo?
+    // How many running sessions this one pet stands in for (count badge when many).
+    var sessionCount: Int = 1
+    // One mark per session — a graphic for every session, in its provider colour,
+    // plus a check for any that just completed.
+    var sessions: [SessionMark] = []
+    // Which source this pet belongs to (GatewayKind rawValue), so a right-click
+    // "Turn Off" can disable the right source's pet. Empty for placeholders.
+    var sourceKey: String = ""
+}
+
 enum PetCatalog {
     static var petsDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".hermes/pets")
@@ -285,6 +298,13 @@ enum PetCatalog {
     // the app syncs them into this cache so they show up locally.
     static var cacheDir: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".hermes/pets-cache")
+    }
+
+    // Pets hidden from the picker: the Lulu capybaras and cats. Nukey (Hermes's
+    // default) and the petdex pets (Boba, Capy, Scoop, …) are all offered.
+    static func isHidden(_ id: String) -> Bool {
+        let lower = id.lowercased()
+        return lower.hasPrefix("lulu") || lower.hasSuffix("cat")
     }
 
     static func installed() -> [PetInfo] {
@@ -305,7 +325,7 @@ enum PetCatalog {
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else { continue }
                 let id = (obj["id"] as? String) ?? name
-                if seen.contains(id) { continue }
+                if seen.contains(id) || isHidden(id) { continue }
                 let sheet = dir.appendingPathComponent((obj["spritesheetPath"] as? String) ?? "spritesheet.webp")
                 guard fm.fileExists(atPath: sheet.path) else { continue }
                 seen.insert(id)
@@ -331,11 +351,60 @@ enum PetCatalog {
         }
         return all.first
     }
+
+    // The pet chosen for a given key (a source: "hermes" / "local"). Falls back
+    // to the global selection when that key has no explicit choice yet, so a
+    // fresh install still shows a companion for every source.
+    static func selected(forKey key: String) -> PetInfo? {
+        let all = installed()
+        if let saved = UserDefaults.standard.string(forKey: "selectedPet.\(key)"),
+           let match = all.first(where: { $0.id == saved }) {
+            return match
+        }
+        return selected()
+    }
+
+    static func setSelected(_ id: String, forKey key: String) {
+        UserDefaults.standard.set(id, forKey: "selectedPet.\(key)")
+    }
+
+    // A small still image of a pet — its thumbnail if one exists, otherwise the
+    // idle frame cropped from its spritesheet — so the UI can always show the
+    // ACTUAL pet (most installed pets ship only a spritesheet, no thumbnail).
+    static func petImage(_ pet: PetInfo, size: CGFloat = 20) -> NSImage? {
+        if let url = pet.thumbnailURL, let img = NSImage(contentsOf: url) {
+            img.size = NSSize(width: size, height: size)
+            return img
+        }
+        guard let sheet = NSImage(contentsOf: pet.spritesheetURL) else { return nil }
+        let frameW: CGFloat = 192, frameH: CGFloat = 208   // idle frame = row 0, col 0
+        let source = NSRect(x: 0, y: sheet.size.height - frameH, width: frameW, height: frameH)
+        let out = NSImage(size: NSSize(width: size, height: size))
+        out.lockFocus()
+        NSGraphicsContext.current?.imageInterpolation = .none
+        let scale = min(size / frameW, size / frameH)
+        let w = frameW * scale, h = frameH * scale
+        sheet.draw(in: NSRect(x: (size - w) / 2, y: (size - h) / 2, width: w, height: h),
+                   from: source, operation: .sourceOver, fraction: 1)
+        out.unlockFocus()
+        return out
+    }
+
+    // Whether a key (source) shows a pet at all (defaults on). Lets you activate
+    // a pet per source from the menu.
+    static func petEnabled(forKey key: String) -> Bool {
+        UserDefaults.standard.object(forKey: "petEnabled.\(key)") == nil
+            || UserDefaults.standard.bool(forKey: "petEnabled.\(key)")
+    }
+
+    static func setPetEnabled(_ on: Bool, forKey key: String) {
+        UserDefaults.standard.set(on, forKey: "petEnabled.\(key)")
+    }
 }
 
 final class ActivityPetsView: NSView {
     static let tileWidth: CGFloat = 56
-    static let tileHeight: CGFloat = 64
+    static let tileHeight: CGFloat = 74   // extra room at the bottom for a session-dots row
     static let tileGap: CGFloat = 5
     private var phase = 0
     private var animationTimer: Timer?
@@ -347,30 +416,115 @@ final class ActivityPetsView: NSView {
     // (8×9 Codex, 9×8 legacy, or the 8×11 sheets that add a sleep row 10).
     static let frameW: CGFloat = 192
     static let frameH: CGFloat = 208
-    private var spritesheet: NSImage?
-    private var thumbnail: NSImage?
-    func setPet(_ pet: PetInfo?) {
-        spritesheet = pet.flatMap { NSImage(contentsOf: $0.spritesheetURL) }
-        thumbnail = pet?.thumbnailURL.flatMap { NSImage(contentsOf: $0) }
-        needsDisplay = true
-    }
+    // One pet per tile. Sprite / thumbnail images are cached by pet id so the
+    // per-frame redraw (every 0.16s) never re-reads them from disk.
+    private var sheetCache: [String: NSImage] = [:]
+    private var thumbCache: [String: NSImage] = [:]
+    // How many frames each row actually uses, per pet. Sheets are left-packed and
+    // rows vary in length (e.g. the "duck" packs 4 frames where Nukey packs 8), so
+    // we loop each row's real frame count instead of a fixed guess — otherwise a
+    // short row runs into blank cells and the pet flickers/vanishes. Derived once
+    // per sheet by scanning alpha (see detectFramesPerRow) and cached by pet id.
+    private var frameCounts: [String: [Int]] = [:]
     var onMove: ((CGFloat, CGFloat) -> Void)?
     var onSelect: ((ProviderActivityInstance) -> Void)?
-    var instances: [ProviderActivityInstance] = [] {
+    // Right-click actions: turn a source's pet off, or resize all the pets.
+    var onTurnOff: ((PetTile) -> Void)?
+    var onScaleChanged: (() -> Void)?
+    // A user-chosen magnification for the whole pet strip (right-click → Pet Size).
+    // Drawing stays in logical tile coordinates; the view just scales up, and
+    // hit-testing / tooltips divide back down. Three fixed sizes.
+    static let petSizes: [(name: String, value: CGFloat)] = [
+        ("Small", 1.0), ("Medium", 1.5), ("Large", 2.0)
+    ]
+    var scale: CGFloat = {
+        let saved = CGFloat(UserDefaults.standard.double(forKey: "petScale"))
+        // Snap to the nearest known size (default Small) so a stale value is safe.
+        return petSizes.min { abs($0.value - saved) < abs($1.value - saved) }
+            .map { abs($0.value - saved) < 0.25 ? $0.value : 1 } ?? 1
+    }()
+    // The tile the context menu was opened over (so its menu items act on it).
+    private var contextTile: PetTile?
+    var tiles: [PetTile] = [] {
         didSet {
+            loadArt()
             rebuildToolTips()
             needsDisplay = true
         }
     }
 
+    private func loadArt() {
+        for tile in tiles {
+            guard let pet = tile.pet else { continue }
+            if sheetCache[pet.id] == nil, let img = NSImage(contentsOf: pet.spritesheetURL) {
+                sheetCache[pet.id] = img
+                frameCounts[pet.id] = Self.detectFramesPerRow(img)
+            }
+            if thumbCache[pet.id] == nil, let url = pet.thumbnailURL, let img = NSImage(contentsOf: url) {
+                thumbCache[pet.id] = img
+            }
+        }
+    }
+
+    // Count the left-packed frames in each row of a sprite sheet by scanning the
+    // alpha channel: a row's frame count is how many leading columns hold visible
+    // pixels. Cheap (sampled, once per sheet) and lets any atlas shape animate
+    // without a hard-coded frames-per-row. Returns [] if the bitmap is unreadable,
+    // in which case drawNukey falls back to a sensible default.
+    private static func detectFramesPerRow(_ image: NSImage) -> [Int] {
+        guard let rep = NSBitmapImageRep(data: image.tiffRepresentation ?? Data()),
+              let data = rep.bitmapData else { return [] }
+        let fw = Int(frameW), fh = Int(frameH)
+        let pw = rep.pixelsWide, ph = rep.pixelsHigh
+        guard fw > 0, fh > 0, pw >= fw, ph >= fh else { return [] }
+        let cols = pw / fw, rows = ph / fh
+        let bpr = rep.bytesPerRow, bpp = rep.bitsPerPixel / 8, spp = rep.samplesPerPixel
+        let hasAlpha = rep.hasAlpha && spp >= 4
+        let alphaOffset = rep.bitmapFormat.contains(.alphaFirst) ? 0 : spp - 1
+        // No alpha channel ⇒ can't tell blanks apart; treat every column as used.
+        guard hasAlpha else { return Array(repeating: cols, count: rows) }
+        func occupied(colX: Int, rowY: Int) -> Bool {
+            var y = rowY
+            while y < rowY + fh {
+                var x = colX
+                while x < colX + fw {
+                    if Int(data[y * bpr + x * bpp + alphaOffset]) > 16 { return true }
+                    x += 4   // sparse sample — plenty to spot a non-empty frame
+                }
+                y += 4
+            }
+            return false
+        }
+        var out: [Int] = []
+        out.reserveCapacity(rows)
+        for r in 0..<rows {
+            var count = 0
+            for c in 0..<cols {
+                if occupied(colX: c * fw, rowY: r * fh) { count += 1 } else { break }
+            }
+            out.append(max(count, 1))
+        }
+        return out
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        animationTimer = Timer.scheduledTimer(withTimeInterval: 0.16, repeats: true) { [weak self] _ in
+        // 10 fps redraw drives the smooth bob/pulse; the sprite frame advances
+        // every 2 ticks (→ a calm 5 fps, see drawNukey), so each frame is held for
+        // exactly the same time — even, not staggered. The 1680 wrap is a multiple
+        // of every frame count (1…8) and of the sin periods, so nothing jumps when
+        // the counter rolls over.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let self else { return }
-            phase = (phase + 1) % 96
+            phase = (phase + 1) % 1680
             needsDisplay = true
         }
+        // Run in .common modes so the pet keeps animating while the status-bar
+        // menu is open (menu tracking switches the run loop to event-tracking
+        // mode, where a default-mode timer would be paused).
+        RunLoop.current.add(timer, forMode: .common)
+        animationTimer = timer
     }
 
     required init?(coder: NSCoder) {
@@ -410,32 +564,93 @@ final class ActivityPetsView: NSView {
         onSelect?(instance)
     }
 
-    private func instance(at point: NSPoint) -> ProviderActivityInstance? {
+    // Right-click: a small menu to resize the pets (three sizes) or turn one off.
+    override func rightMouseDown(with event: NSEvent) {
+        contextTile = tile(at: convert(event.locationInWindow, from: nil))
+        let menu = NSMenu()
+
+        let sizeMenu = NSMenu()
+        for (index, option) in Self.petSizes.enumerated() {
+            let item = NSMenuItem(title: option.name, action: #selector(setSize(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = abs(scale - option.value) < 0.01 ? .on : .off
+            sizeMenu.addItem(item)
+        }
+        let sizeItem = NSMenuItem(title: "Pet Size", action: nil, keyEquivalent: "")
+        sizeItem.submenu = sizeMenu
+        menu.addItem(sizeItem)
+
+        if let tile = contextTile, !tile.sourceKey.isEmpty {
+            menu.addItem(.separator())
+            let off = NSMenuItem(title: "Turn Off \(tile.instance.profile) Pet",
+                                 action: #selector(turnOffPet), keyEquivalent: "")
+            off.target = self
+            menu.addItem(off)
+        }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
+    }
+
+    @objc private func setSize(_ sender: NSMenuItem) {
+        guard Self.petSizes.indices.contains(sender.tag) else { return }
+        scale = Self.petSizes[sender.tag].value
+        UserDefaults.standard.set(Double(scale), forKey: "petScale")
+        rebuildToolTips()
+        needsDisplay = true
+        onScaleChanged?()   // let the panel resize to fit
+    }
+
+    @objc private func turnOffPet() {
+        guard let tile = contextTile else { return }
+        onTurnOff?(tile)
+    }
+
+    private func tile(at point: NSPoint) -> PetTile? {
+        // Points arrive in (scaled-up) view space; map back to logical tile space.
+        let logical = NSPoint(x: point.x / scale, y: point.y / scale)
         let step = Self.tileWidth + Self.tileGap
-        let index = Int(point.x / step)
-        guard instances.indices.contains(index) else { return nil }
-        let tile = NSRect(x: CGFloat(index) * step, y: 0, width: Self.tileWidth, height: Self.tileHeight)
-        return tile.contains(point) ? instances[index] : nil
+        let index = Int(logical.x / step)
+        guard tiles.indices.contains(index) else { return nil }
+        let rect = NSRect(x: CGFloat(index) * step, y: 0, width: Self.tileWidth, height: Self.tileHeight)
+        return rect.contains(logical) ? tiles[index] : nil
+    }
+
+    private func instance(at point: NSPoint) -> ProviderActivityInstance? {
+        tile(at: point)?.instance
     }
 
     private func rebuildToolTips() {
         toolTipTags.forEach(removeToolTip)
-        toolTipTags = instances.indices.map { index in
-            let x = CGFloat(index) * (Self.tileWidth + Self.tileGap)
-            return addToolTip(NSRect(x: x, y: 0, width: Self.tileWidth, height: Self.tileHeight), owner: self, userData: nil)
+        toolTipTags = tiles.indices.map { index in
+            let x = CGFloat(index) * (Self.tileWidth + Self.tileGap) * scale
+            return addToolTip(NSRect(x: x, y: 0, width: Self.tileWidth * scale, height: Self.tileHeight * scale), owner: self, userData: nil)
         }
     }
 
     func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
-        guard let instance = instance(at: point) else { return "Hermes" }
+        guard let tile = tile(at: point) else { return "Provider quotas" }
+        let instance = tile.instance
         if instance.key == "needs-login" {
             return instance.profile == "No source"
                 ? "Nothing enabled — enable Hermes or Local"
                 : "\(instance.profile) disconnected — sign in to see quotas"
         }
-        let state = instance.sleeping ? "Sleeping" : instance.completed ? "Completed" : instance.failed ? "Error" : instance.status == "waiting" ? "Waiting for input" : "Processing"
-        let title = instance.title.isEmpty ? "Hermes session" : instance.title
-        return "\(instance.profile) · \(title) · \(state)"
+        let state: String
+        switch instance.status {
+        case "error", "failed": state = "Not working"
+        case "waiting":         state = "Needs attention"
+        case "completed":       state = "Done"
+        case "sleeping":        state = "Idle"
+        default:                state = "Working"
+        }
+        // With several sessions, one pet stands in for all of them — name the count
+        // and the provider they use; otherwise show the single session's detail.
+        if tile.sessionCount > 1 {
+            let provider = instance.providerLabel.isEmpty ? "" : "\(instance.providerLabel) "
+            return "\(instance.profile) · \(tile.sessionCount) \(provider)sessions · \(state)"
+        }
+        let detail = instance.title.isEmpty ? "" : " · \(instance.title)"
+        return "\(instance.profile)\(detail) · \(state)"
     }
 
     private func profileColor(_ profile: String) -> NSColor {
@@ -446,17 +661,14 @@ final class ActivityPetsView: NSView {
         return NSColor(calibratedHue: CGFloat(hash % 360) / 360, saturation: 0.62, brightness: 0.94, alpha: 1)
     }
 
-    private func drawNukey(_ instance: ProviderActivityInstance, in destination: NSRect) {
-        var target = destination
-        if instance.status == "waiting" {
-            target.origin.y += CGFloat(sin(Double(phase) * .pi / 4)) * 1.5
-        } else if instance.failed {
-            target.origin.x += phase.isMultiple(of: 2) ? -1.8 : 1.8
-        } else if instance.status == "working" {
-            // Busy little bob while it "cooks".
-            target.origin.y += CGFloat(sin(Double(phase) * .pi / 4)) * 1.1
-        }
-        if let image = spritesheet {
+    private func drawNukey(_ instance: ProviderActivityInstance, image: NSImage?, thumbnail: NSImage?, rowFrames: [Int], in destination: NSRect) {
+        // No artificial per-frame position offset in ANY state — the pet moves
+        // purely through its own sprite frames, so it animates smoothly and never
+        // shakes/jitters. (The error/failed state used to add a ±1.8px left-right
+        // wobble every frame — that was the "shaking"; the waiting/working states
+        // added sine bobs — all removed so every state just "moves properly".)
+        let target = destination
+        if let image {
             let frameWidth = Self.frameW
             let frameHeight = Self.frameH
             let now = Date().timeIntervalSince1970 * 1000
@@ -476,8 +688,15 @@ final class ActivityPetsView: NSView {
             case "sleeping":           row = 0   // dormant/idle → the pet's own idle
             default:                   row = 0   // idle
             }
-            // Hermes steps FRAMES_PER_STATE (6) columns across the loop.
-            let frame = phase / 2 % 6
+            // Step across only the frames this row actually holds (left-packed),
+            // so a short row (e.g. the duck's 4-frame idle) loops cleanly instead
+            // of stepping into blank cells. Fall back to 6 if we couldn't measure.
+            let rowFrameCount = max(rowFrames.indices.contains(row) ? rowFrames[row] : 6, 1)
+            // Advance one frame every 2 redraw ticks — a calm ~5 fps where every
+            // frame is held for exactly the same time, so the walk/idle cycle reads
+            // as steady, not staggered or rushed. (1680 is a multiple of every
+            // frame count, so the loop stays even across the phase wrap.)
+            let frame = (phase / 2) % rowFrameCount
             let source = NSRect(
                 x: CGFloat(frame) * frameWidth,
                 y: image.size.height - CGFloat(row + 1) * frameHeight,
@@ -495,59 +714,115 @@ final class ActivityPetsView: NSView {
         thumbnail?.draw(in: target, from: .zero, operation: .sourceOver, fraction: 1)
     }
 
-    private func drawPet(_ instance: ProviderActivityInstance, tile: NSRect) {
+    private func drawPet(_ tile: PetTile, rect tileRect: NSRect) {
+        let instance = tile.instance
+        let sheet = tile.pet.flatMap { sheetCache[$0.id] }
+        let thumb = tile.pet.flatMap { thumbCache[$0.id] }
+        let rowFrames = tile.pet.flatMap { frameCounts[$0.id] } ?? []
         let working = instance.status == "working"
         let failed = instance.failed
-        let petRect = NSRect(x: tile.minX + 2, y: tile.minY + 8, width: 52, height: 56.3)
+        // Pet sits in the upper part; the bottom ~14pt is a dedicated dots row.
+        let petRect = NSRect(x: tileRect.minX + 2, y: tileRect.minY + 16, width: 52, height: 56.3)
         let halo = NSBezierPath(ovalIn: NSRect(x: petRect.minX + 4, y: petRect.minY + 5, width: petRect.width - 8, height: petRect.height - 10))
-        // Hermes purple is the primary halo accent; status recolours it.
+        // Hermes blue is the primary halo accent; status recolours it.
         let haloColor: NSColor = failed ? .hermesRed : instance.status == "waiting" ? .hermesOrange : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
         let haloPulse = CGFloat((sin(Double(phase) * .pi / 6) + 1) * 0.035)
         haloColor.withAlphaComponent((working || failed ? 0.17 : 0.09) + haloPulse).setFill()
         halo.fill()
-        drawNukey(instance, in: petRect)
+        drawNukey(instance, image: sheet, thumbnail: thumb, rowFrames: rowFrames, in: petRect)
 
-        if working {
-            for index in 0..<3 {
-                let active = index == phase % 3
-                let size: CGFloat = active ? 4.5 : 3.4
-                let x = tile.midX - 8 + CGFloat(index) * 8 - size / 2
-                let dot = NSBezierPath(ovalIn: NSRect(x: x, y: tile.minY + 5, width: size, height: size))
-                NSColor.hermesBlue.withAlphaComponent(active ? 1 : 0.45).setFill()
+        // One mark per session, in a dedicated row ALONG THE BOTTOM (below the pet,
+        // on a dark backing pill so it stands out against the pet's own colour): a
+        // dot per session in its provider colour — bright while busy, dim while
+        // idle — or a green check for a session that just finished.
+        if !tile.sessions.isEmpty {
+            let marks = Array(tile.sessions.prefix(8))
+            let n = marks.count
+            let dotSize: CGFloat = 6
+            let spacing: CGFloat = n > 5 ? 7.5 : 9
+            let span = CGFloat(n - 1) * spacing
+            let startX = tileRect.midX - span / 2
+            let cy = tileRect.minY + 7
+            let pill = NSRect(x: startX - dotSize / 2 - 4, y: cy - 6.5, width: span + dotSize + 8, height: 13)
+            let pillPath = NSBezierPath(roundedRect: pill, xRadius: 6.5, yRadius: 6.5)
+            NSColor.black.withAlphaComponent(0.4).setFill()
+            pillPath.fill()
+            for (index, mark) in marks.enumerated() {
+                let cx = startX + CGFloat(index) * spacing
+                // One dot per RUNNING session, in its provider's colour. A session
+                // only appears here while it's live, so there's no finished state to
+                // draw — the dot just disappears when the session ends.
+                let highlight = mark.busy && index == phase % max(n, 1)
+                let pulse: CGFloat = mark.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(index)) + 1) * 0.5) : 0
+                let size = dotSize + (highlight ? 1.0 : 0) + pulse
+                let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
+                (NSColor(activityHex: mark.hex) ?? .hermesBlue).withAlphaComponent(mark.busy ? 1 : 0.55).setFill()
                 dot.fill()
+                NSColor.white.withAlphaComponent(0.85).setStroke()
+                dot.lineWidth = 0.75
+                dot.stroke()
             }
-        } else if instance.status == "waiting" || failed {
+        }
+
+        // Status badge, top-right (kept clear of the bottom dots row).
+        if instance.status == "waiting" || failed {
             let pulse = CGFloat((sin(Double(phase) * .pi / 4) + 1) * 1.2)
-            let badge = NSBezierPath(ovalIn: NSRect(x: tile.maxX - 16 - pulse / 2, y: tile.minY + 2 - pulse / 2, width: 14 + pulse, height: 14 + pulse))
+            let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16 - pulse / 2, y: tileRect.maxY - 16 - pulse / 2, width: 14 + pulse, height: 14 + pulse))
             (failed ? NSColor.hermesRed : NSColor.hermesOrange).setFill()
             badge.fill()
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 9, weight: .bold),
                 .foregroundColor: NSColor.white
             ]
-            NSAttributedString(string: failed ? "!" : "?", attributes: attributes).draw(at: NSPoint(x: tile.maxX - (failed ? 10.6 : 12.3), y: tile.minY + 3.4))
+            NSAttributedString(string: failed ? "!" : "?", attributes: attributes).draw(at: NSPoint(x: tileRect.maxX - (failed ? 10.6 : 12.3), y: tileRect.maxY - 14.6))
         } else if instance.completed {
-            let badge = NSBezierPath(ovalIn: NSRect(x: tile.maxX - 16, y: tile.minY + 2, width: 14, height: 14))
+            let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16, y: tileRect.maxY - 16, width: 14, height: 14))
             NSColor.hermesGreen.setFill()
             badge.fill()
             let check = NSBezierPath()
-            check.move(to: NSPoint(x: tile.maxX - 12.5, y: tile.minY + 9))
-            check.line(to: NSPoint(x: tile.maxX - 9.7, y: tile.minY + 6))
-            check.line(to: NSPoint(x: tile.maxX - 5, y: tile.minY + 11.5))
+            check.move(to: NSPoint(x: tileRect.maxX - 12.5, y: tileRect.maxY - 9))
+            check.line(to: NSPoint(x: tileRect.maxX - 9.7, y: tileRect.maxY - 12))
+            check.line(to: NSPoint(x: tileRect.maxX - 5, y: tileRect.maxY - 6.5))
             NSColor.white.setStroke()
             check.lineWidth = 1.8
             check.lineCapStyle = .round
             check.lineJoinStyle = .round
             check.stroke()
         }
+
+        // The per-session dots show up to 8; beyond that, a count badge (top-left,
+        // provider colour) gives the true total.
+        if tile.sessionCount > 8 {
+            let color = NSColor(activityHex: instance.providerColor) ?? .hermesBlue
+            let d: CGFloat = 16
+            let rect = NSRect(x: tileRect.minX + 1, y: tileRect.maxY - d - 1, width: d, height: d)
+            let badge = NSBezierPath(ovalIn: rect)
+            color.setFill(); badge.fill()
+            NSColor.white.withAlphaComponent(0.9).setStroke(); badge.lineWidth = 1; badge.stroke()
+            let text = tile.sessionCount > 9 ? "9+" : "\(tile.sessionCount)"
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: tile.sessionCount > 9 ? 8 : 9.5, weight: .bold),
+                .foregroundColor: NSColor.white
+            ]
+            let string = NSAttributedString(string: text, attributes: attributes)
+            let size = string.size()
+            string.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        for (index, instance) in instances.enumerated() {
-            let x = CGFloat(index) * (Self.tileWidth + Self.tileGap)
-            drawPet(instance, tile: NSRect(x: x, y: 0, width: Self.tileWidth, height: Self.tileHeight))
+        NSGraphicsContext.saveGraphicsState()
+        if scale != 1 {
+            let transform = NSAffineTransform()
+            transform.scale(by: scale)
+            transform.concat()
         }
+        for (index, tile) in tiles.enumerated() {
+            let x = CGFloat(index) * (Self.tileWidth + Self.tileGap)
+            drawPet(tile, rect: NSRect(x: x, y: 0, width: Self.tileWidth, height: Self.tileHeight))
+        }
+        NSGraphicsContext.restoreGraphicsState()
     }
 }
 
@@ -559,9 +834,10 @@ final class ActivityPetsPanel: NSPanel {
             petsView.onSelect = onSelect
         }
     }
-
-    func setPet(_ pet: PetInfo?) {
-        petsView.setPet(pet)
+    var onTurnOff: ((PetTile) -> Void)? {
+        didSet {
+            petsView.onTurnOff = onTurnOff
+        }
     }
 
     init() {
@@ -585,6 +861,13 @@ final class ActivityPetsPanel: NSPanel {
             UserDefaults.standard.set(frame.origin.x, forKey: "activityPetsX")
             UserDefaults.standard.set(frame.origin.y, forKey: "activityPetsY")
         }
+        petsView.onScaleChanged = { [weak self] in self?.relayout() }
+    }
+
+    // Re-fit the panel to the current tiles at the current scale (after Enlarge).
+    func relayout() {
+        guard !petsView.tiles.isEmpty else { return }
+        show(petsView.tiles)
     }
 
     private func constrainedOrigin(_ origin: NSPoint, size: NSSize) -> NSPoint {
@@ -596,13 +879,18 @@ final class ActivityPetsPanel: NSPanel {
         )
     }
 
-    func show(_ instances: [ProviderActivityInstance]) {
-        let visible = Array(instances.prefix(8))
-        let width = CGFloat(visible.count) * ActivityPetsView.tileWidth + CGFloat(max(0, visible.count - 1)) * ActivityPetsView.tileGap
-        let size = NSSize(width: width, height: ActivityPetsView.tileHeight)
+    func show(_ tiles: [PetTile]) {
+        let visible = Array(tiles.prefix(8))
+        guard !visible.isEmpty else {
+            orderOut(nil)
+            return
+        }
+        let logicalWidth = CGFloat(visible.count) * ActivityPetsView.tileWidth + CGFloat(max(0, visible.count - 1)) * ActivityPetsView.tileGap
+        let scale = petsView.scale
+        let size = NSSize(width: logicalWidth * scale, height: ActivityPetsView.tileHeight * scale)
         let previousOrigin = frame.origin
         petsView.frame = NSRect(origin: .zero, size: size)
-        petsView.instances = visible
+        petsView.tiles = visible
         setContentSize(size)
         let origin: NSPoint
         if placed {
@@ -644,6 +932,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let generatedAt: String?
     }
     private var sources: [SourceQuota] = []
+    // Sources just switched on and awaiting their first fetch — shown with a
+    // spinner ("Activating …") until the fetch that follows completes.
+    private var activating: Set<GatewayKind> = []
+    // Sources being re-checked via a provider row's Refresh — that row shows a
+    // spinner in place of its refresh icon until the fetch returns.
+    private var refreshingKinds: Set<GatewayKind> = []
     private var desktopStatus = DesktopStatus(running: false, mode: "unknown", authMode: "unknown", remoteURL: nil, signedIn: false, reachable: false, profile: nil, provider: nil, model: nil)
     private var refreshing = false
     private var timer: Timer?
@@ -664,12 +958,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         return out
     }()
-    private var activityTimer: Timer?
     private let activityPanel = ActivityPetsPanel()
-    private var activityPetsEnabled: Bool = {
-        let defaults = UserDefaults.standard
-        return defaults.object(forKey: "activityPetsEnabled") == nil || defaults.bool(forKey: "activityPetsEnabled")
-    }()
+    private var activityTimer: Timer?
+    // Cached Hermes gateway activity (polled from /api/status), driving the Hermes
+    // pet's working state — works for a remote gateway where sessions run server-side.
+    private var hermesBusy = false
+    private var hermesActiveAgents = 0
+    // Provider colour (hex) per ACTIVE Hermes session, so its dots match the real
+    // provider (e.g. OpenRouter purple) instead of a generic gateway colour.
+    private var hermesSessionHexes: [String] = []
+    private var hermesActivityTimer: Timer?
+    private var hermesPollInFlight = false
 
     private func sourceName(_ kind: GatewayKind) -> String {
         kind == .local ? "Local" : "Hermes"
@@ -678,10 +977,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Any enabled source returned data.
     private var anyConnected: Bool {
         sources.contains { $0.connected }
-    }
-
-    private func hermesSource() -> SourceQuota? {
-        sources.first { $0.kind == .hermes }
     }
 
     // Every enabled source is down (or none is enabled) — drives the "not
@@ -696,7 +991,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activityPanel.onSelect = { [weak self] instance in
             self?.openHermesSession(instance)
         }
-        activityPanel.setPet(PetCatalog.selected())
+        // Right-click "Turn Off" on a pet disables that source's pet and refreshes
+        // both the floating pets and the menu's paw toggle so they stay in sync.
+        activityPanel.onTurnOff = { [weak self] tile in
+            guard let self, !tile.sourceKey.isEmpty else { return }
+            PetCatalog.setPetEnabled(false, forKey: tile.sourceKey)
+            self.updateActivityPets()
+            self.rebuildMenu()
+        }
         syncPetsFromGateway()
         updateStatusItem()
         rebuildMenu()
@@ -705,9 +1007,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.refresh()
             self?.syncPetsFromGateway()  // pick up newly-installed gateway pets
         }
-        refreshActivityPets()
-        activityTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.refreshActivityPets()
+        updateActivityPets()
+        // Poll local usage every 1s so the Local pet turns active as soon as a
+        // `claude` session is busy.
+        activityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateActivityPets()
+        }
+        // Poll the Hermes gateway a bit slower than local (it's a network call),
+        // but often enough that a finished session's dot clears promptly.
+        pollHermesActivity()
+        hermesActivityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.pollHermesActivity()
         }
         signal(SIGUSR1, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
@@ -720,6 +1030,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         activityTimer?.invalidate()
+        hermesActivityTimer?.invalidate()
         activityPanel.orderOut(nil)
     }
 
@@ -803,18 +1114,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let symbol = providerSymbolName(provider.provider)
         let image = NSImageView(frame: NSRect(x: 32, y: 25, width: 16, height: 16))
         image.image = NSImage(systemSymbolName: symbol, accessibilityDescription: provider.label)
-        image.contentTintColor = connected && provider.status == "ok" ? providerBrandColor(provider) : providerIndicatorColor(provider, connected: connected)
+        // Always the provider's own colour — even out of quota or offline — so the
+        // row reads consistently; the status dot (red ring) flags any problem.
+        image.contentTintColor = providerBrandColor(provider)
         view.addSubview(image)
         view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold)))
         if let plan = provider.plan {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 95, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
         }
         let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
         statusImage.image = providerDotImage(provider, size: 14, connected: connected)
         view.addSubview(statusImage)
-        // Brief line: summary text + an overall provider-coloured bar.
-        let summaryColor: NSColor = (connected && provider.status == "ok") ? .secondaryLabelColor : providerIndicatorColor(provider, connected: connected)
-        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: summaryColor))
+        // Brief line: summary text + an overall provider-coloured bar. Same font
+        // and colour regardless of status (out of quota / offline included) so the
+        // provider info always reads the same; the status dot conveys any problem.
+        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
         if connected, provider.status == "ok", let minimum = providerMinimum(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
@@ -836,21 +1150,128 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.action = #selector(toggleProviderExpanded)
         button.toolTip = expanded ? "Collapse \(provider.label)" : "Expand \(provider.label)"
         view.addSubview(button)
+        // Eye toggle: whether this provider's dot shows in the closed menu bar.
+        // Added AFTER the full-row expand button so it stays independently
+        // clickable on top of it.
+        let shown = providerShownInMenuBar(kind, provider.provider)
+        let eye = NSButton(frame: NSRect(x: 300, y: 24, width: 18, height: 18))
+        eye.isBordered = false
+        eye.title = ""
+        eye.image = NSImage(systemSymbolName: shown ? "eye" : "eye.slash",
+                            accessibilityDescription: shown ? "Shown in menu bar" : "Hidden from menu bar")
+        eye.imagePosition = .imageOnly
+        eye.imageScaling = .scaleProportionallyDown
+        eye.contentTintColor = shown ? .hermesBlue : .tertiaryLabelColor
+        eye.identifier = NSUserInterfaceItemIdentifier(key)
+        eye.target = self
+        eye.action = #selector(toggleProviderMenuBar(_:))
+        eye.toolTip = shown ? "Hide \(provider.label) from the menu bar" : "Show \(provider.label) in the menu bar"
+        view.addSubview(eye)
         return view
     }
 
-    // Small source header shown above a source's providers when >1 source is on.
+    // Per-source header: the source's identity (name + connected/disconnected) on
+    // the left, and a compact right-aligned cluster of that source's OWN controls
+    // — its pet (paw toggles on/off, thumbnail cycles) plus, for Hermes, its
+    // gateway Login/Logout and Setup. One header per enabled source, so a source's
+    // controls sit right where its connection state shows. Kept tight with small
+    // icon buttons so the section stays concise.
     private func sourceHeaderView(_ source: SourceQuota) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 22))
-        let dot = NSImageView(frame: NSRect(x: 16, y: 6, width: 9, height: 9))
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 28))
+        let kind = source.kind
+        let name = sourceName(kind)
+        let dot = NSImageView(frame: NSRect(x: 16, y: 10, width: 9, height: 9))
         dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
         dot.contentTintColor = source.connected ? .hermesGreen : .hermesRed
         view.addSubview(dot)
-        view.addSubview(label(sourceName(source.kind).uppercased(), frame: NSRect(x: 32, y: 4, width: 200, height: 14),
-                              font: .systemFont(ofSize: 9.5, weight: .semibold), color: .secondaryLabelColor))
-        view.addSubview(label(source.connected ? "connected" : "disconnected", frame: NSRect(x: 214, y: 4, width: 128, height: 14),
-                              font: .systemFont(ofSize: 9.5), color: source.connected ? .hermesGreen : .hermesRed, alignment: .right))
+        view.addSubview(label(name.uppercased(), frame: NSRect(x: 30, y: 8, width: 66, height: 14),
+                              font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor))
+        // The dot's colour already conveys the connection state; a row tooltip
+        // spells it out, so the width goes to clearly-labelled controls instead.
+        view.toolTip = "\(name) — \(source.connected ? "connected" : "disconnected")"
+
+        // Right-aligned cluster of this source's own controls — plain, uniform icon
+        // buttons: a per-SOURCE Refresh, the pet (paw toggle + its picture to
+        // switch), then — Hermes only — login/logout and setup.
+        let key = kind.rawValue
+        let on = PetCatalog.petEnabled(forKey: key)
+        let pet = PetCatalog.selected(forKey: key)
+        var controls: [NSButton] = []
+
+        if !PetCatalog.installed().isEmpty {
+            controls.append(iconButton(image: NSImage(systemSymbolName: on ? "pawprint.fill" : "pawprint", accessibilityDescription: nil),
+                                       tint: on ? .hermesBlue : .tertiaryLabelColor, dim: !on,
+                                       action: #selector(toggleSourcePet(_:)), key: key,
+                                       tooltip: on ? "Turn off \(name)'s pet" : "Turn on \(name)'s pet"))
+            if on, let pet, PetCatalog.installed().count > 1 {
+                // The switcher IS the pet's picture, so you see what you'll get.
+                controls.append(iconButton(image: PetCatalog.petImage(pet, size: 20), tint: nil,
+                                           action: #selector(cycleSourcePet(_:)), key: key,
+                                           tooltip: "Switch \(name)'s pet — now \(pet.displayName)"))
+            }
+        }
+
+        if kind == .hermes {
+            if source.connected {
+                controls.append(iconButton(image: NSImage(systemSymbolName: "rectangle.portrait.and.arrow.right", accessibilityDescription: nil),
+                                           tint: .hermesRed, action: #selector(signOutGateway), key: nil,
+                                           tooltip: "Log out of the Hermes gateway"))
+            } else {
+                controls.append(iconButton(image: NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil),
+                                           tint: .hermesGreen, action: #selector(signInGateway), key: nil,
+                                           tooltip: "Log in to the Hermes gateway"))
+            }
+            controls.append(iconButton(image: NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil),
+                                       tint: .hermesBlue, action: #selector(openGatewaySetup), key: nil,
+                                       tooltip: "Set up the Hermes gateway"))
+        }
+
+        // Rightmost slot: the per-SOURCE Refresh (re-checks this whole source) —
+        // a spinner while it's fetching. Then the other controls lay out to its
+        // left, right-aligned, uniform 22pt with even gaps.
+        var x: CGFloat = 344
+        if refreshingKinds.contains(kind) {
+            let spinner = NSProgressIndicator(frame: NSRect(x: x - 19, y: 5, width: 15, height: 15))
+            spinner.style = .spinning
+            spinner.controlSize = .small
+            spinner.isIndeterminate = true
+            spinner.usesThreadedAnimation = true
+            spinner.startAnimation(nil)
+            view.addSubview(spinner)
+        } else {
+            let refresh = iconButton(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil),
+                                     tint: .hermesBlue, action: #selector(refreshSourceAction(_:)),
+                                     key: key, tooltip: "Refresh \(name)")
+            refresh.frame = NSRect(x: x - 22, y: 3, width: 22, height: 22)
+            view.addSubview(refresh)
+        }
+        x -= 26
+
+        for button in controls.reversed() {
+            x -= 22
+            button.frame = NSRect(x: x, y: 3, width: 22, height: 22)
+            view.addSubview(button)
+            x -= 4
+        }
         return view
+    }
+
+    // A plain, reliably-rendering icon button used across the header and provider
+    // clusters. `tint` nil leaves a full-colour image (e.g. a pet picture) untinted.
+    private func iconButton(image: NSImage?, tint: NSColor?, dim: Bool = false, action: Selector, key: String?, tooltip: String) -> NSButton {
+        let button = NSButton()
+        button.isBordered = false
+        button.title = ""
+        button.image = image
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        if let tint { button.contentTintColor = tint }
+        button.alphaValue = dim ? 0.55 : 1.0
+        button.target = self
+        button.action = action
+        if let key { button.identifier = NSUserInterfaceItemIdentifier(key) }
+        button.toolTip = tooltip
+        return button
     }
 
     // Bar colour = the provider's brand colour, turning red only when exhausted.
@@ -867,6 +1288,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? [("openrouter", "OpenRouter"), ("anthropic", "Claude"), ("openai-codex", "Codex")]
             : cached.map { ($0.slug, $0.label) }
         return base.map { QuotaProvider(provider: $0.0, label: $0.1, status: "disconnected", plan: nil, windows: [], details: [], message: "Disconnected") }
+    }
+
+    // Smooth over TRANSIENT provider errors (e.g. Claude's usage API returning
+    // HTTP 429 while Claude itself works fine locally): cache each provider's last
+    // "ok" reading and, if a later fetch comes back not-ok, keep showing the cached
+    // one for a while instead of flashing a red "issue". Persisted so it survives
+    // relaunches. Returns the providers to actually display for this source.
+    private static let lastGoodTTL: TimeInterval = 15 * 60
+
+    private func applyLastGood(_ providers: [QuotaProvider], kind: GatewayKind) -> [QuotaProvider] {
+        providers.map { provider in
+            let dataKey = "goodQuota.\(providerKey(kind, provider.provider))"
+            let atKey = "goodQuotaAt.\(providerKey(kind, provider.provider))"
+            if provider.status == "ok" {
+                if let data = try? JSONEncoder().encode(provider) {
+                    UserDefaults.standard.set(data, forKey: dataKey)
+                    UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: atKey)
+                }
+                return provider
+            }
+            // Non-ok fetch → show the last good reading if it's recent enough.
+            let at = UserDefaults.standard.double(forKey: atKey)
+            if at > 0, Date().timeIntervalSince1970 - at < Self.lastGoodTTL,
+               let data = UserDefaults.standard.data(forKey: dataKey),
+               let cached = try? JSONDecoder().decode(QuotaProvider.self, from: data) {
+                return cached
+            }
+            return provider
+        }
     }
 
 
@@ -889,14 +1339,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return formatter.string(from: NSNumber(value: amount)) ?? String(format: "$%.2f", amount)
     }
 
+    // Canonical provider identity — one source of truth so a provider looks the
+    // SAME across sources (Local vs Hermes) and in the pet. Aliases collapse to a
+    // canonical slug, then colour/label/symbol are derived from that.
+    static func normalizedProvider(_ slug: String) -> String {
+        switch slug.lowercased() {
+        case "anthropic", "claude", "claude-sub":          return "anthropic"
+        case "openai-codex", "codex", "openai", "chatgpt": return "openai-codex"
+        case "openrouter":                                 return "openrouter"
+        case "copilot", "copilot-acp", "github-copilot":   return "copilot"
+        default:                                           return slug.lowercased()
+        }
+    }
+
+    static func providerHex(_ slug: String) -> String {
+        switch normalizedProvider(slug) {
+        case "openrouter":   return "#8e1afe"   // purple
+        case "anthropic":    return "#d97757"   // orange
+        case "openai-codex": return "#10a37f"   // green
+        case "copilot":      return "#6e7681"   // grey
+        default:             return "#8e8e93"   // unknown → neutral grey
+        }
+    }
+
+    static func providerLabel(_ slug: String) -> String {
+        switch normalizedProvider(slug) {
+        case "openrouter":   return "OpenRouter"
+        case "anthropic":    return "Claude"
+        case "openai-codex": return "Codex"
+        default:             return slug.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
     private func providerSymbolName(_ provider: String) -> String {
-        switch provider {
-        case "openrouter":
-            return "arrow.triangle.branch"
-        case "anthropic":
-            return "sparkles"
-        default:
-            return "chevron.left.forwardslash.chevron.right"
+        switch Self.normalizedProvider(provider) {
+        case "openrouter": return "arrow.triangle.branch"
+        case "anthropic":  return "sparkles"
+        default:           return "chevron.left.forwardslash.chevron.right"   // Codex / other
         }
     }
 
@@ -905,40 +1384,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func providerBrandColor(_ provider: String) -> NSColor {
-        switch provider {
-        case "openrouter":
-            return NSColor(deviceRed: 142 / 255, green: 26 / 255, blue: 254 / 255, alpha: 1)
-        case "anthropic":
-            return NSColor(deviceRed: 217 / 255, green: 119 / 255, blue: 87 / 255, alpha: 1)
-        default:
-            return NSColor(deviceRed: 16 / 255, green: 163 / 255, blue: 127 / 255, alpha: 1)
+        NSColor(activityHex: Self.providerHex(provider))
+            ?? NSColor(deviceRed: 16 / 255, green: 163 / 255, blue: 127 / 255, alpha: 1)
+    }
+
+    // Draws a provider status dot into the current context: the dot in the
+    // provider's own colour, and — when it's OFFLINE or OUT OF QUOTA — a bold red
+    // ring drawn OUTSIDE it (with a clear gap) so the alert reads at a glance.
+    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool) {
+        let s = rect.width
+        let fillInset = bad ? s * 0.26 : s * 0.12
+        let fill = NSBezierPath(ovalIn: rect.insetBy(dx: fillInset, dy: fillInset))
+        color.setFill()
+        fill.fill()
+        if bad {
+            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: s * 0.1, dy: s * 0.1))
+            NSColor.hermesRed.setStroke()
+            ring.lineWidth = max(2, s * 0.16)
+            ring.stroke()
         }
+    }
+
+    // The red alert ring is ONLY for offline (source down) or out-of-quota — a
+    // provider that's connected but momentarily can't read its usage (e.g. a 429)
+    // is not an "issue", so it keeps its normal coloured dot.
+    private func providerAlarming(_ provider: QuotaProvider, connected: Bool) -> Bool {
+        let offline = !connected
+        let exhausted = provider.status == "ok" && providerIsExhausted(provider)
+        return offline || exhausted
     }
 
     private func providerDotImage(_ provider: QuotaProvider, size: CGFloat, connected: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
-        let dot = NSBezierPath(ovalIn: NSRect(x: 1.5, y: 1.5, width: size - 3, height: size - 3))
-        providerBrandColor(provider).setFill()
-        dot.fill()
-        let disconnected = !connected || provider.status != "ok"
-        let exhausted = !disconnected && providerIsExhausted(provider)
-        if disconnected || exhausted {
-            (disconnected ? NSColor.hermesRed : NSColor.hermesYellow).setStroke()
-            dot.lineWidth = 2
-            dot.stroke()
-        }
+        let bad = providerAlarming(provider, connected: connected)
+        drawProviderDot(in: NSRect(x: 0, y: 0, width: size, height: size),
+                        color: providerBrandColor(provider), bad: bad)
         image.unlockFocus()
         image.isTemplate = false
-        image.accessibilityDescription = disconnected ? "\(provider.label) is not connected" : exhausted ? "\(provider.label) has no quota" : "\(provider.label) is active"
+        image.accessibilityDescription = !connected ? "\(provider.label) is not connected" : bad ? "\(provider.label) has no quota" : "\(provider.label) is active"
         return image
     }
 
-    private func providerIndicatorColor(_ provider: QuotaProvider, connected: Bool) -> NSColor {
-        guard connected else { return .hermesRed }
-        // Blue accent for a healthy provider; a degraded one turns orange.
-        return provider.status == "ok" ? .hermesBlue : .hermesOrange
-    }
 
     // Shortest relative time until any of this provider's windows reset, e.g.
     // "in 6d". Used to surface the expiration in the collapsed provider row.
@@ -978,28 +1465,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func statusDotsImage() -> NSImage {
-        let entries = allEntries()
-        let count = max(entries.count, 1)
-        let image = NSImage(size: NSSize(width: CGFloat(count * 15 + 2), height: 15))
-        image.lockFocus()
-        if entries.isEmpty {
+        // Closed-menu circles are grouped BY SOURCE (section), with an extra gap
+        // between sources so Hermes vs Local is distinguishable at a glance. Each
+        // source contributes only the providers you haven't hidden with the eye.
+        let step: CGFloat = 15      // per-dot advance
+        let sectionGap: CGFloat = 9 // extra space between source sections
+        let sections: [(connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
+            let visible = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
+            return visible.isEmpty ? nil : (source.connected, visible)
+        }
+        let dotCount = sections.reduce(0) { $0 + $1.providers.count }
+
+        if dotCount == 0 {
+            let image = NSImage(size: NSSize(width: 15, height: 15))
+            image.lockFocus()
             let color = anyConnected ? NSColor.tertiaryLabelColor : NSColor.hermesRed
             color.setStroke()
             let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 11, height: 11))
             dot.lineWidth = 2
             dot.stroke()
+            image.unlockFocus()
+            image.isTemplate = false
+            return image
         }
-        for (index, entry) in entries.enumerated() {
-            let disconnected = !entry.connected || entry.provider.status != "ok"
-            let exhausted = !disconnected && providerIsExhausted(entry.provider)
-            let dot = NSBezierPath(ovalIn: NSRect(x: CGFloat(index * 15 + 2), y: 2, width: 11, height: 11))
-            providerBrandColor(entry.provider.provider).setFill()
-            dot.fill()
-            if disconnected || exhausted {
-                (disconnected ? NSColor.hermesRed : NSColor.hermesYellow).setStroke()
-                dot.lineWidth = 2
-                dot.stroke()
+
+        let width = CGFloat(dotCount) * step + CGFloat(max(0, sections.count - 1)) * sectionGap + 2
+        let image = NSImage(size: NSSize(width: width, height: 15))
+        image.lockFocus()
+        var x: CGFloat = 2
+        for (index, section) in sections.enumerated() {
+            for provider in section.providers {
+                drawProviderDot(in: NSRect(x: x, y: 2, width: 11, height: 11),
+                                color: providerBrandColor(provider.provider),
+                                bad: providerAlarming(provider, connected: section.connected))
+                x += step
             }
+            if index < sections.count - 1 { x += sectionGap }
         }
         image.unlockFocus()
         image.isTemplate = false
@@ -1098,6 +1599,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return view
     }
 
+    // Shown in place of a disconnected source's provider rows: no providers, no
+    // quota — just a "sign in to fix" prompt with the login button right here in
+    // the provider window (not only the small header icon).
+    private func disconnectedPromptView(_ source: SourceQuota) -> NSView {
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 44))
+        let icon = NSImageView(frame: NSRect(x: 30, y: 14, width: 16, height: 16))
+        icon.image = NSImage(systemSymbolName: "person.crop.circle.badge.exclamationmark", accessibilityDescription: nil)
+        icon.contentTintColor = .hermesRed
+        view.addSubview(icon)
+        let msg = source.kind == .hermes
+            ? "Not signed in — sign in to see quotas"
+            : "Sign in to your local providers to see quotas"
+        view.addSubview(label(msg, frame: NSRect(x: 54, y: 15, width: 196, height: 15),
+                              font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+        if source.kind == .hermes {
+            let btn = textActionButton("Sign in", action: #selector(signInGateway), glowColor: .hermesGreen)
+            btn.frame = NSRect(x: 258, y: 9, width: 88, height: 26)
+            view.addSubview(btn)
+        }
+        return view
+    }
+
     private func textActionButton(_ title: String, action: Selector, glowColor: NSColor = .hermesBlue) -> HoverGlowButton {
         let button = HoverGlowButton(title: title, target: self, action: action)
         button.controlSize = .small
@@ -1149,109 +1672,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return view
     }
 
-    // Clickable row (shown when pets are on) that displays the current pet and,
-    // on click, scrolls to the next installed pet.
-    private func petCycleView() -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
-        let pets = PetCatalog.installed()
-        let current = PetCatalog.selected()
-
-        let icon = NSImageView(frame: NSRect(x: 16, y: 12, width: 16, height: 16))
-        icon.image = NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: nil)
-        icon.contentTintColor = .hermesBlue
-        view.addSubview(icon)
-
-        var textX: CGFloat = 42
-        if let url = current?.thumbnailURL, let img = NSImage(contentsOf: url) {
-            img.size = NSSize(width: 24, height: 24)
-            let thumb = NSImageView(frame: NSRect(x: 42, y: 8, width: 24, height: 24))
-            thumb.image = img
-            view.addSubview(thumb)
-            textX = 72
-        }
-        view.addSubview(label("Pet: \(current?.displayName ?? "—")",
-                              frame: NSRect(x: textX, y: 12, width: 170, height: 16),
-                              font: .systemFont(ofSize: 12, weight: .medium)))
-        let hint = pets.count > 1 ? "click to switch · \(pets.count)" : "1 installed"
-        view.addSubview(label(hint, frame: NSRect(x: 214, y: 12, width: 128, height: 16),
-                              font: .systemFont(ofSize: 10), color: .secondaryLabelColor, alignment: .right))
-
-        if pets.count > 1 {
-            let button = NSButton(frame: view.bounds)
-            button.isBordered = false
-            button.title = ""
-            button.target = self
-            button.action = #selector(cyclePet)
-            button.toolTip = "Switch to the next installed pet"
-            view.addSubview(button)
-        }
-        return view
-    }
-
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
-        // Laid out left→right by how often each control is used; Close is pinned
-        // far right by convention (least used / destructive).
-        var x: CGFloat = 16
-
-        // 1) Refresh quotas — the most frequent action.
-        let refresh = iconActionButton(NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil), label: "Refresh quotas", action: #selector(refreshAction), glowColor: .hermesBlue)
-        refresh.frame = NSRect(x: x, y: 7, width: 28, height: 28)
-        refresh.isEnabled = !refreshing
-        view.addSubview(refresh)
-        x += 34
-
-        // 2) Open the Hermes app — only when Hermes is enabled and installed.
-        if gatewayEnabled(.hermes), let appPath = gatewayAppURL()?.path {
-            let appIcon = (NSWorkspace.shared.icon(forFile: appPath).copy() as? NSImage)
-            appIcon?.size = NSSize(width: 16, height: 16)
-            let openBtn = iconActionButton(appIcon, label: "Open Hermes", action: #selector(openGateway), glowColor: .hermesBlue)
-            openBtn.frame = NSRect(x: x, y: 7, width: 28, height: 28)
-            view.addSubview(openBtn)
-            x += 34
-        }
-
-        // 3) Activity pets on/off — a glowing chip matching the other buttons:
-        // blue glow when on, dim grey when off.
-        let petsIcon = NSImage(systemSymbolName: activityPetsEnabled ? "pawprint.fill" : "pawprint", accessibilityDescription: nil)
-        let petsBtn = iconActionButton(petsIcon,
-                                       label: activityPetsEnabled ? "Hide activity pets" : "Show activity pets",
-                                       action: #selector(togglePetsButton),
-                                       glowColor: activityPetsEnabled ? .hermesBlue : .disabledControlTextColor)
-        petsBtn.frame = NSRect(x: x, y: 7, width: 28, height: 28)
-        view.addSubview(petsBtn)
-        x += 34
-
-        // 4) Login / Logout for the Hermes gateway session (Hermes has one;
-        // Local providers authenticate via their own CLIs). Logout when the Hermes
-        // source is connected, Login when it isn't.
-        if gatewayEnabled(.hermes) {
-            if hermesSource()?.connected == true {
-                let logout = textActionButton("Logout", action: #selector(signOutGateway), glowColor: .hermesRed)
-                logout.frame = NSRect(x: x, y: 7, width: 70, height: 28)
-                logout.toolTip = "Log out of the Hermes gateway"
-                view.addSubview(logout)
-                x += 76
-            } else {
-                let login = textActionButton("Login", action: #selector(signInGateway), glowColor: .hermesGreen)
-                login.frame = NSRect(x: x, y: 7, width: 70, height: 28)
-                login.toolTip = "Log in to the Hermes gateway"
-                view.addSubview(login)
-                x += 76
-            }
-        }
-
-        // 5) Setup — configure the Hermes gateway (opens its Desktop gateway page).
-        // Shown whenever Hermes is enabled, so you can point/repair the gateway.
-        if gatewayEnabled(.hermes) {
-            let setup = iconActionButton(NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil), label: "Set up Hermes gateway", action: #selector(openGatewaySetup), glowColor: .hermesBlue)
-            setup.frame = NSRect(x: x, y: 7, width: 28, height: 28)
-            setup.toolTip = "Set up the Hermes gateway (opens the Hermes Desktop gateway page)"
-            view.addSubview(setup)
-            x += 34
-        }
-
-        // 6) Close — least used / destructive, pinned far right.
+        // Refresh is per-provider now (a refresh icon on each provider row), so the
+        // bottom bar just has Close.
         let close = iconActionButton(NSImage(systemSymbolName: "xmark", accessibilityDescription: nil), label: "Close Provider Quotas", action: #selector(quit), glowColor: .hermesRed)
         close.frame = NSRect(x: 314, y: 7, width: 28, height: 28)
         view.addSubview(close)
@@ -1263,39 +1687,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         addView(titleView())
         addView(gatewayRowView())
-        if sources.isEmpty {
-            let message = enabledGateways().isEmpty
-                ? "Enable Hermes or Local above"
-                : (refreshing ? "Loading quotas…" : "Quota data unavailable")
-            addView(messageView(message))
+        let enabled = enabledGateways()
+        if enabled.isEmpty {
+            addView(messageView("Enable Hermes or Local above"))
         } else {
-            // One block per enabled source. With more than one source, a small
-            // header labels each so the same provider from each is distinct.
-            let showHeaders = sources.count > 1
-            for source in sources {
-                if showHeaders { addView(sourceHeaderView(source)) }
-                for provider in source.providers {
-                    addView(providerView(provider, kind: source.kind, connected: source.connected))
-                    // Collapsed by default; expand to see per-window detail.
-                    guard expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
-                    if provider.windows.isEmpty {
-                        addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
+            // One block per enabled source, each led by its header — which also
+            // carries that source's pet controls (paw + switch + On/Off), so pet
+            // config lives right where the source's name + connection show. A source
+            // that's still activating (no data yet) shows a spinner in its place.
+            for kind in enabled {
+                guard let source = sources.first(where: { $0.kind == kind }) else {
+                    if activating.contains(kind) || refreshing {
+                        addView(loadingRowView(name: sourceName(kind)))
                     }
-                    for window in provider.windows {
-                        addView(windowView(window, provider: provider))
+                    continue
+                }
+                addView(sourceHeaderView(source))
+                if source.connected {
+                    for provider in source.providers {
+                        addView(providerView(provider, kind: source.kind, connected: source.connected))
+                        // Collapsed by default; expand to see per-window detail.
+                        guard expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
+                        if provider.windows.isEmpty {
+                            addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
+                        }
+                        for window in provider.windows {
+                            addView(windowView(window, provider: provider))
+                        }
+                        for detail in provider.details {
+                            addView(detailView(detail))
+                        }
                     }
-                    for detail in provider.details {
-                        addView(detailView(detail))
-                    }
+                } else {
+                    // Disconnected source: don't list individual providers or any
+                    // quota — just prompt to sign in (the header already shows it's
+                    // down). Avoids stale/leftover quota reading as if it's live.
+                    addView(disconnectedPromptView(source))
                 }
             }
         }
-        // When pets are on, a clickable row shows the current pet and cycles
-        // through the other installed pets on click.
-        if activityPetsEnabled, PetCatalog.installed().count > 0 {
-            addView(petCycleView())
-        }
         addView(actionBarView())
+    }
+
+    // Shown in place of a source's block while it's activating (just switched on,
+    // fetching its first quotas): a spinner + "Activating <source>…".
+    private func loadingRowView(name: String) -> NSView {
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
+        let spinner = NSProgressIndicator(frame: NSRect(x: 16, y: 8, width: 14, height: 14))
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isIndeterminate = true
+        spinner.usesThreadedAnimation = true   // keeps spinning while the menu tracks
+        spinner.startAnimation(nil)
+        view.addSubview(spinner)
+        view.addSubview(label("Activating \(name)…", frame: NSRect(x: 38, y: 8, width: 280, height: 14),
+                              font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor))
+        return view
     }
 
     private func parsedDate(_ value: String?) -> Date? {
@@ -1320,43 +1767,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "\(relativeText) · \(date.formatted(date: .abbreviated, time: .shortened))"
     }
 
-    @objc private func refreshAction() {
-        refresh()
-    }
-
-    private func setActivityPets(_ enabled: Bool) {
-        activityPetsEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "activityPetsEnabled")
-        if enabled {
-            activityPanel.setPet(PetCatalog.selected())
-            syncPetsFromGateway()
-            refreshActivityPets()
-        } else {
-            activityPanel.orderOut(nil)
+    // Per-source Refresh (icon in the source header): re-check that whole source.
+    // Its header shows a spinner meanwhile.
+    @objc private func refreshSourceAction(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
+        guard !refreshingKinds.contains(kind) else { return }
+        refreshingKinds.insert(kind)
+        rebuildMenu()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Self.fetchPayload(kind: kind)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refreshingKinds.remove(kind)
+                switch result {
+                case .success(let payload):
+                    let providers = self.applyLastGood(payload.providers, kind: kind)
+                    self.upsertSource(SourceQuota(kind: kind, providers: providers, connected: true, generatedAt: payload.generatedAt))
+                    self.lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
+                    UserDefaults.standard.set(providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
+                    UserDefaults.standard.set(providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
+                case .failure:
+                    self.upsertSource(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
+                }
+                self.updateStatusItem()
+                self.rebuildMenu()
+                self.updateActivityPets()
+            }
         }
-        rebuildMenu()
     }
 
-    @objc private func selectPet(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        UserDefaults.standard.set(id, forKey: "selectedPet")
-        activityPanel.setPet(PetCatalog.selected())
-        rebuildMenu()
+    // Replace (or insert) one source, keeping the Hermes-before-Local order.
+    private func upsertSource(_ source: SourceQuota) {
+        if let index = sources.firstIndex(where: { $0.kind == source.kind }) {
+            sources[index] = source
+        } else {
+            sources.append(source)
+            sources.sort { ($0.kind == .hermes ? 0 : 1) < ($1.kind == .hermes ? 0 : 1) }
+        }
     }
 
-    @objc private func cyclePet() {
+    // Cycle ONE source's pet to the next installed one.
+    @objc private func cycleSourcePet(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue else { return }
         let pets = PetCatalog.installed()
         guard pets.count > 1 else { return }
-        let currentId = PetCatalog.selected()?.id
+        let currentId = PetCatalog.selected(forKey: key)?.id
         let index = pets.firstIndex { $0.id == currentId } ?? -1
-        let next = pets[(index + 1) % pets.count]
-        UserDefaults.standard.set(next.id, forKey: "selectedPet")
-        activityPanel.setPet(PetCatalog.selected())
+        PetCatalog.setSelected(pets[(index + 1) % pets.count].id, forKey: key)
+        updateActivityPets()
         rebuildMenu()
     }
 
-    @objc private func togglePetsButton() {
-        setActivityPets(!activityPetsEnabled)
+    // Activate / deactivate the pet for ONE source.
+    @objc private func toggleSourcePet(_ sender: NSButton) {
+        guard let key = sender.identifier?.rawValue else { return }
+        PetCatalog.setPetEnabled(!PetCatalog.petEnabled(forKey: key), forKey: key)
+        if key == GatewayKind.hermes.rawValue { pollHermesActivity() }
+        updateActivityPets()
+        rebuildMenu()
     }
 
     // Enable / disable a single source. sender.identifier is the kind's rawValue.
@@ -1364,7 +1832,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
         let nowOn = !gatewayEnabled(kind)
         setGatewayEnabled(kind, nowOn)
-        if !nowOn {
+        if nowOn {
+            // Turning a source on kicks off a fetch — mark it activating so the
+            // menu shows a spinner for it until the data lands.
+            activating.insert(kind)
+        } else {
+            activating.remove(kind)
             // Disabling a source removes ALL of its providers: drop it from the
             // live list AND its cached copy so nothing linked to it lingers.
             sources.removeAll { $0.kind == kind }
@@ -1379,14 +1852,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateStatusItem()
         rebuildMenu()
         refresh()
-        refreshActivityPets()
+        updateActivityPets()
+        pollHermesActivity()
     }
 
     // Pull pets that were downloaded on the gateway (remote Desktop installs them
     // there, not on this Mac) into the local pets-cache so they appear in the
     // picker. Uses the same authenticated helper as the quota fetch.
     private func syncPetsFromGateway() {
-        guard activityPetsEnabled else { return }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let fm = FileManager.default
             let helper = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/hermes-desktop-quotas").path
@@ -1397,7 +1870,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let localIds = Set(PetCatalog.installed().map { $0.id })
             var changed = false
             for pet in pets {
-                guard let id = pet["id"] as? String, !localIds.contains(id) else { continue }
+                guard let id = pet["id"] as? String, !localIds.contains(id), !PetCatalog.isHidden(id) else { continue }
                 let dir = PetCatalog.cacheDir.appendingPathComponent(id)
                 let sheet = dir.appendingPathComponent("spritesheet.webp")
                 if fm.fileExists(atPath: sheet.path) { continue }
@@ -1429,7 +1902,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             if changed {
                 DispatchQueue.main.async {
-                    self?.activityPanel.setPet(PetCatalog.selected())
+                    self?.updateActivityPets()
                     self?.rebuildMenu()
                 }
             }
@@ -1438,8 +1911,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private static func runHelper(_ path: String, _ args: [String]) -> Data? {
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
+        // Run via a login shell so the helper's `#!/usr/bin/env bash` shebang and
+        // its tools resolve regardless of the launch PATH (same as the quota path).
+        proc.executableURL = URL(fileURLWithPath: "/bin/bash")
+        proc.arguments = ["-lc", "exec \"$0\" \"$@\"", path] + args
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = Pipe()
@@ -1449,45 +1924,325 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return proc.terminationStatus == 0 ? data : nil
     }
 
-    @objc private func toggleActivityPets(_ sender: NSSwitch) {
-        setActivityPets(sender.state == .on)
-    }
-
-    @objc private func togglePetsCheckbox(_ sender: NSButton) {
-        setActivityPets(sender.state == .on)
-    }
-
-    private func refreshActivityPets() {
-        guard activityPetsEnabled else {
-            activityPanel.orderOut(nil)
-            return
-        }
-        let fallbackProfile = desktopStatus.profile ?? "Hermes"
-        // Captured on the main thread. When every enabled source is disconnected
-        // (or none is enabled) the pet shows a "not working" state.
-        let disconnected = needsLogin
-        let enabled = enabledGateways()
-        let kindName = enabled.isEmpty ? "No source" : enabled.map { sourceName($0) }.joined(separator: " / ")
+    // Rebuild the floating pets: ONE pet per enabled source (Hermes / Local) whose
+    // pet is switched on, each carrying that source's own chosen art. A source's
+    // pet becomes ACTIVE (per session) when the source is being used, sits idle
+    // otherwise, or shows a "not working" state when the source is down. With no
+    // source pet on, the panel hides. Polled on a short timer plus on every
+    // refresh / toggle.
+    private func updateActivityPets() {
+        // Local usage needs a `ps`/transcript scan (blocking) — do it off-main and
+        // render on main. Hermes usage comes from a cached gateway-status poll (see
+        // pollHermesActivity), so there's no network call in this hot path.
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let fetched = Self.fetchProviderActivity()
+            let local = Self.fetchLocalActivity()
             DispatchQueue.main.async {
                 guard let self else { return }
-                let instances: [ProviderActivityInstance]
-                if disconnected {
-                    instances = [Self.needsLoginPlaceholder(gateway: kindName)]
-                } else if fetched.isEmpty {
-                    instances = [Self.sleepingPlaceholder(profile: fallbackProfile)]
-                } else {
-                    instances = fetched
-                }
-                self.activityPanel.show(instances)
+                self.activityPanel.show(self.buildSourcePetTiles(localSessions: local))
             }
         }
     }
 
+    private func buildSourcePetTiles(localSessions: [LocalSession]) -> [PetTile] {
+        let petSources = enabledGateways().filter { PetCatalog.petEnabled(forKey: $0.rawValue) }
+        if petSources.isEmpty { return [] }
+
+        if needsLogin {
+            let name = petSources.map { sourceName($0) }.joined(separator: " / ")
+            return [PetTile(instance: Self.needsLoginPlaceholder(gateway: name),
+                            pet: PetCatalog.selected(forKey: petSources[0].rawValue),
+                            sourceKey: petSources[0].rawValue)]
+        }
+
+        // ONE pet per source. It shows a dot ONLY for each session that's actively
+        // RUNNING, in that session's provider colour. When a session finishes its
+        // dot simply disappears — no lingering checkmark — and when nothing is
+        // running there are no dots at all.
+        var tiles: [PetTile] = []
+        for kind in petSources {
+            let pet = PetCatalog.selected(forKey: kind.rawValue)
+            let connected = sources.first { $0.kind == kind }?.connected ?? false
+            if !connected {
+                tiles.append(PetTile(instance: Self.needsLoginPlaceholder(gateway: sourceName(kind)), pet: pet, sourceKey: kind.rawValue))
+                continue
+            }
+
+            let marks: [SessionMark]
+            let title: String
+            let working: Bool
+            if kind == .hermes {
+                // Dots map ONLY to real running sessions (is_active). Merely being
+                // connected — or the Desktop being active while you sign in — makes
+                // the pet WORK (hermesBusy) but shows NO dots.
+                marks = hermesSessionHexes.map { SessionMark(hex: $0, busy: true) }
+                title = marks.isEmpty ? "" : "\(marks.count) agent\(marks.count == 1 ? "" : "s") running"
+                working = hermesBusy || !marks.isEmpty
+            } else {
+                let busy = localSessions.filter { $0.busy }   // idle/open sessions show nothing
+                marks = busy.map { SessionMark(hex: $0.hex, busy: true) }
+                title = "\(busy.count) session\(busy.count == 1 ? "" : "s")"
+                working = !marks.isEmpty
+            }
+
+            // The pet moves while the source is working; otherwise it sits idle.
+            // Dots only appear for genuinely running sessions.
+            let display = working
+                ? Self.workingSourceInstance(name: sourceName(kind), title: title)
+                : Self.idleSourceInstance(name: sourceName(kind))
+            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue))
+        }
+        return tiles
+    }
+
+    // Whether the Hermes gateway is working right now, plus one provider colour
+    // PER running session (so N concurrent sessions → N dots, even several of the
+    // same provider). We read /api/status for the aggregate flags and then scan
+    // every profile's recent sessions, emitting a colour for each that's live
+    // (`is_active`, or still-open and just touched), keyed off its
+    // `billing_provider` — so OpenRouter shows purple, Codex green, etc. Works for
+    // a REMOTE gateway, where sessions run server-side.
+    private static func fetchGatewayActivity() -> (busy: Bool, agents: Int, sessionHexes: [String]) {
+        let helper = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+        guard FileManager.default.isExecutableFile(atPath: helper) else {
+            return (desktopSessionStreaming(), 0, [])
+        }
+        // One helper call resolves the gateway once and returns /api/status plus
+        // every profile's recent sessions (see desktop-quotas.sh --activity). We
+        // scan those sessions UNCONDITIONALLY, because bot turns run as `source:
+        // cli` sessions that never flip the aggregate active_agents/active_sessions
+        // counters — so a Codex-backed bot mid-reply looks idle in /api/status but
+        // is plainly running in its session's flags.
+        var agents = 0, statusBusy = false
+        var hexes: [String] = []
+        if let data = runHelper(helper, ["--activity"]),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            agents = (obj["agents"] as? Int) ?? 0
+            statusBusy = (obj["status_busy"] as? Bool) ?? false
+            let now = Date().timeIntervalSince1970
+            for session in (obj["sessions"] as? [[String: Any]]) ?? [] {
+                // `is_active` is the gateway's real "working right now" flag — it
+                // reads false for sessions that are merely open-but-idle (some
+                // linger with ended_at == null for days), so we lean on it. That
+                // means the dot clears the moment a turn ends, with no trailing
+                // lag. `last_active` within a SHORT window is only a bridge across
+                // poll timing (not a lingering tail); a cleanly-closed session
+                // (ended_at set) is never running. One colour PER running session,
+                // so N sessions → N dots (several of one provider → several dots).
+                let isActive = (session["is_active"] as? Bool) ?? false
+                let ended = session["ended_at"] != nil && !(session["ended_at"] is NSNull)
+                let lastActive = session["last_active"] as? Double
+                let recentlyActive = !ended && (lastActive.map { now - $0 < 4 } ?? false)
+                guard isActive || recentlyActive else { continue }
+                let provider = (session["billing_provider"] as? String)
+                    ?? (session["provider"] as? String) ?? ""
+                hexes.append(providerHex(provider))
+            }
+        }
+        var busy = statusBusy || !hexes.isEmpty
+        // The Desktop app streams a chat by writing its Local Storage constantly
+        // (fresh within seconds ⇒ in progress); let that animate the pet as
+        // "working". We deliberately do NOT invent provider dots from the open
+        // chat tiles — dots must map to REAL running sessions (is_active). So
+        // merely having the Desktop active (e.g. while signing in) shows the pet
+        // working with no dots, instead of lighting up every open chat's provider.
+        if !busy { busy = desktopSessionStreaming() }
+        return (busy, agents, hexes)
+    }
+
+    private static func desktopSessionStreaming() -> Bool {
+        let running = NSWorkspace.shared.runningApplications.contains {
+            $0.bundleIdentifier == "com.nousresearch.hermes" || $0.executableURL?.lastPathComponent == "Hermes"
+        }
+        guard running else { return false }
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Hermes/Local Storage/leveldb")
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return false }
+        let newest = files.compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }.max()
+        guard let newest else { return false }
+        return Date().timeIntervalSince(newest) < 10
+    }
+
+    // Poll the gateway for Hermes activity and cache it; refresh the pets when it
+    // changes. Called on a network timer, separate from the 1s local scan. The
+    // in-flight guard keeps a slow round-trip (it makes several remote calls) from
+    // piling up behind the 2s timer.
+    private func pollHermesActivity() {
+        guard gatewayEnabled(.hermes), PetCatalog.petEnabled(forKey: "hermes") else {
+            if hermesBusy || hermesActiveAgents != 0 {
+                hermesBusy = false; hermesActiveAgents = 0; updateActivityPets()
+            }
+            return
+        }
+        guard !hermesPollInFlight else { return }
+        hermesPollInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let (busy, agents, hexes) = Self.fetchGatewayActivity()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.hermesPollInFlight = false
+                let changed = self.hermesBusy != busy || self.hermesActiveAgents != agents || self.hermesSessionHexes != hexes
+                self.hermesBusy = busy
+                self.hermesActiveAgents = agents
+                self.hermesSessionHexes = hexes
+                if changed { self.updateActivityPets() }
+            }
+        }
+    }
+
+    private static func workingSourceInstance(name: String, title: String) -> ProviderActivityInstance {
+        ProviderActivityInstance(
+            completedAt: nil, key: "\(name):working", model: "", profile: name,
+            provider: "source", providerColor: "#0053fd", providerLabel: "",
+            sessionId: "", startedAt: Date().timeIntervalSince1970,
+            status: "working", title: title)
+    }
+
+    // Seconds since a session's log was last written before we treat it as idle.
+    private static let localBusyWindow = 20.0     // log written this recently ⇒ actively processing
+    private static let localPresentWindow = 180.0 // …this recently ⇒ session still open (idle)
+    // Codex flushes its rollout in BURSTS — during model reasoning it can go
+    // ~20–30s between writes — so a 20s window would blink the dot off mid-turn.
+    // A wider window keeps a working Codex session lit through those gaps and
+    // clears it a bit after the session truly goes quiet. (Claude streams its
+    // transcript continuously, so it keeps the tighter localBusyWindow.)
+    private static let codexBusyWindow = 90.0
+
+    struct LocalSession { let key: String; let hex: String; let busy: Bool; let order: Int }
+
+    // Local sessions currently RUNNING, across providers — a Claude Code session
+    // (its `claude` process is alive) or a Codex session (its rollout was written
+    // recently). `busy` = actively processing right now (its log is fresh within
+    // that tool's write cadence — see localBusyWindow / codexBusyWindow);
+    // otherwise it's running-but-idle. Grouped Claude, then Codex.
+    private static func fetchLocalActivity() -> [LocalSession] {
+        let now = Date()
+        return (claudeSessions(now: now) + codexSessions(now: now)).sorted { $0.order < $1.order }
+    }
+
+    // Assistant `stop_reason` values that mean the turn is OVER (not waiting on a
+    // tool). When the last message event is one of these, the session is idle.
+    private static let claudeTerminalStops: Set<String> = ["end_turn", "stop_sequence", "max_tokens"]
+
+    // Is a Claude session actively working, read from its transcript's tail so the
+    // dot clears the instant a turn ends — no window/lag. The last message event
+    // tells us the exact state: a `user` line means a prompt or tool-result is
+    // awaiting a response (working); an `assistant` line with a terminal
+    // stop_reason means the turn finished (idle); anything else (a `tool_use`
+    // stop, or a still-forming message) means working. Meta lines (title, mode,
+    // pr-link, …) are skipped. Returns nil if the tail can't be decided, so the
+    // caller can fall back to file freshness.
+    private static func claudeTurnActive(_ url: URL) -> Bool? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let tail: UInt64 = 512 * 1024
+        let start = size > tail ? size - tail : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+        var lines = String(decoding: data, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+        if start > 0, !lines.isEmpty { lines.removeFirst() }   // drop the partial first line
+        for line in lines.reversed() {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let type = obj["type"] as? String else { continue }
+            if type == "user" { return true }          // prompt / tool-result → a reply is due
+            if type == "assistant" {
+                let stop = (obj["message"] as? [String: Any])?["stop_reason"] as? String
+                if let stop, claudeTerminalStops.contains(stop) { return false }   // turn finished
+                return true                              // tool_use pending or mid-generation
+            }
+            // system / summary / meta line → keep scanning backward
+        }
+        return nil
+    }
+
+    // Every live `claude` process (with a session id) = a present session; busy
+    // reflects its transcript's exact turn state (see claudeTurnActive), falling
+    // back to file freshness if the transcript tail can't be read.
+    private static func claudeSessions(now: Date) -> [LocalSession] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-axo", "command="]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return [] }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+
+        let nonSession: Set<String> = ["login", "logout", "mcp", "config", "doctor",
+                                       "update", "upgrade", "install", "migrate-installer",
+                                       "--version", "-v", "--help", "-h"]
+        var ids: [String] = []
+        for raw in text.split(separator: "\n") {
+            let tokens = raw.split(separator: " ").map(String.init)
+            guard let first = tokens.first,
+                  (first as NSString).lastPathComponent == "claude" else { continue }
+            if tokens.count > 1, nonSession.contains(tokens[1]) { continue }
+            guard let id = flagValue("--session-id", in: tokens) ?? flagValue("--resume", in: tokens) else { continue }
+            ids.append(id)
+        }
+        guard !ids.isEmpty else { return [] }
+
+        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
+        let hex = providerHex("anthropic")
+        return ids.map { id in
+            var transcript: URL?
+            var age = Double.greatestFiniteMagnitude
+            for dir in dirs {
+                let candidate = dir.appendingPathComponent("\(id).jsonl")
+                if let modified = (try? FileManager.default.attributesOfItem(atPath: candidate.path))?[.modificationDate] as? Date {
+                    transcript = candidate
+                    age = now.timeIntervalSince(modified)
+                    break
+                }
+            }
+            // Prefer the exact turn state (no lag); fall back to freshness only if
+            // the transcript tail can't be parsed.
+            let busy = transcript.flatMap { claudeTurnActive($0) } ?? (age < localBusyWindow)
+            return LocalSession(key: "local:claude:\(id)", hex: hex, busy: busy, order: 0)
+        }
+    }
+
+    // Codex has no per-session process to watch, so use its rollout freshness:
+    // present if written within the present window, busy if within the codex busy
+    // one. Rollouts are foldered by the session's START date, so a session that
+    // began days ago but is still being written today lives in an OLDER day's
+    // folder — scan the last several days, not just today/yesterday, or a
+    // long-running session goes invisible.
+    private static func codexSessions(now: Date) -> [LocalSession] {
+        let base = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions")
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy/MM/dd"
+        let hex = providerHex("openai-codex")
+        var out: [LocalSession] = []
+        var seen = Set<String>()
+        for day in 0...6 {   // today + the previous 6 days (start-date foldering)
+            let dir = base.appendingPathComponent(formatter.string(from: now.addingTimeInterval(Double(-day) * 86_400)))
+            guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            for file in files where file.lastPathComponent.hasPrefix("rollout-") && file.pathExtension == "jsonl" {
+                guard let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
+                let age = now.timeIntervalSince(modified)
+                guard age < localPresentWindow else { continue }
+                let key = "local:codex:\(file.lastPathComponent)"
+                guard seen.insert(key).inserted else { continue }
+                out.append(LocalSession(key: key, hex: hex, busy: age < codexBusyWindow, order: 1))
+            }
+        }
+        return out
+    }
+
+    private static func flagValue(_ flag: String, in tokens: [String]) -> String? {
+        guard let index = tokens.firstIndex(of: flag), index + 1 < tokens.count else { return nil }
+        return tokens[index + 1]
+    }
+
     // A "not working" pet: the error/struggling animation + red halo + "!" badge
-    // (drawPet/drawNukey render status "failed" that way), signalling the active
-    // gateway is disconnected and needs a sign-in.
+    // (drawPet/drawNukey render status "failed" that way), signalling the source
+    // is disconnected and needs a sign-in.
     private static func needsLoginPlaceholder(gateway: String) -> ProviderActivityInstance {
         ProviderActivityInstance(
             completedAt: nil,
@@ -1504,39 +2259,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
     }
 
-    private static func sleepingPlaceholder(profile: String) -> ProviderActivityInstance {
+    // A connected-but-idle source pet: calm idle animation, no badge.
+    private static func idleSourceInstance(name: String) -> ProviderActivityInstance {
         ProviderActivityInstance(
             completedAt: nil,
-            key: "\(profile):profile",
-            model: "Default model",
-            profile: profile,
-            provider: "provider",
+            key: "\(name):idle",
+            model: "",
+            profile: name,
+            provider: "source",
             providerColor: "#8e8e93",
-            providerLabel: "Hermes",
+            providerLabel: name,
             sessionId: "",
             startedAt: Date().timeIntervalSince1970,
             status: "sleeping",
-            title: profile == "Hermes" ? "Open Hermes" : profile
+            title: "Not in use"
         )
-    }
-
-    private static func fetchProviderActivity() -> [ProviderActivityInstance] {
-        let running = NSWorkspace.shared.runningApplications.contains {
-            $0.bundleIdentifier == "com.nousresearch.hermes" || $0.executableURL?.lastPathComponent == "Hermes"
-        }
-        guard running else { return [] }
-        let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Hermes/provider-activity.json")
-        guard let data = try? Data(contentsOf: url),
-              let payload = try? JSONDecoder().decode(ProviderActivityPayload.self, from: data),
-              Date().timeIntervalSince1970 * 1000 - payload.updatedAt < 12_000 else { return [] }
-        let now = Date().timeIntervalSince1970 * 1000
-        return payload.instances
-            .filter { !$0.completed || now - ($0.completedAt ?? now) < 8_000 }
-            .sorted {
-                if $0.activityRank != $1.activityRank { return $0.activityRank < $1.activityRank }
-                return $0.startedAt < $1.startedAt
-            }
     }
 
     private func refreshDesktopStatus() {
@@ -1579,9 +2316,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for (kind, result) in results {
                     switch result {
                     case .success(let payload):
-                        built.append(SourceQuota(kind: kind, providers: payload.providers, connected: true, generatedAt: payload.generatedAt))
+                        let providers = self.applyLastGood(payload.providers, kind: kind)
+                        built.append(SourceQuota(kind: kind, providers: providers, connected: true, generatedAt: payload.generatedAt))
                         // Remember this source's provider list for a later disconnect.
-                        self.lastProvidersByKind[kind.rawValue] = payload.providers.map { ($0.provider, $0.label) }
+                        self.lastProvidersByKind[kind.rawValue] = providers.map { ($0.provider, $0.label) }
                         UserDefaults.standard.set(payload.providers.map { $0.provider }, forKey: "lastProviderSlugs.\(kind.rawValue)")
                         UserDefaults.standard.set(payload.providers.map { $0.label }, forKey: "lastProviderLabels.\(kind.rawValue)")
                     case .failure:
@@ -1590,8 +2328,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                 }
                 self.sources = built
+                self.activating.removeAll()   // data landed → clear the spinners
                 self.updateStatusItem()
                 self.rebuildMenu()
+                self.updateActivityPets()
             }
         }
     }
@@ -1644,12 +2384,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             $0.bundleIdentifier == "com.nousresearch.hermes" || $0.executableURL?.lastPathComponent == "Hermes"
         }
         let support = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support/Hermes")
-        let connectionURL = support.appendingPathComponent("connection.json")
         let storageURL = support.appendingPathComponent("Local Storage/leveldb")
         let values = readDesktopStorage(at: storageURL)
         let profile = values["hermes-desktop-active-profile-v1"]
         let provider = values["hermes.desktop.composer.provider"]
         let model = values["hermes.desktop.composer.model"]
+
+        // Adopt whichever gateway THIS Desktop is bound to, from its own config —
+        // prefer the v2 connections.json ({primary, connections:[{kind,url}]}),
+        // fall back to the legacy connection.json — exactly like the quota helper,
+        // so ANY Hermes Desktop setup works, not one specific machine/gateway.
+        if let data = try? Data(contentsOf: support.appendingPathComponent("connections.json")),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let list = root["connections"] as? [[String: Any]], !list.isEmpty {
+            let primaryID = root["primary"] as? String
+            let primary = list.first { ($0["id"] as? String) == primaryID } ?? list[0]
+            if (primary["kind"] as? String) == "local" {
+                return DesktopStatus(running: running, mode: "local", authMode: "local", remoteURL: nil, signedIn: true, reachable: running, profile: profile, provider: provider, model: model)
+            }
+            let remoteURL = primary["url"] as? String
+            let authMode = (primary["authMode"] as? String) ?? "oauth"
+            let signedIn = remoteURL.map { hasNativeOAuthSession(for: $0, support: support) } ?? false
+            let reachable = remoteURL.map { gatewayIsReachable($0) } ?? false
+            return DesktopStatus(running: running, mode: "remote", authMode: authMode, remoteURL: remoteURL, signedIn: signedIn, reachable: reachable, profile: profile, provider: provider, model: model)
+        }
+
+        // Legacy connection.json fallback.
+        let connectionURL = support.appendingPathComponent("connection.json")
         guard let data = try? Data(contentsOf: connectionURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return DesktopStatus(running: running, mode: "unknown", authMode: "unknown", remoteURL: nil, signedIn: false, reachable: false, profile: profile, provider: provider, model: model)
@@ -1769,6 +2530,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func enabledGateways() -> [GatewayKind] {
         [.hermes, .local].filter { gatewayEnabled($0) }
+    }
+
+    // Whether a provider's dot appears in the CLOSED menu-bar status item
+    // (defaults on). Toggled by the eye icon on each provider row.
+    private func providerShownInMenuBar(_ kind: GatewayKind, _ slug: String) -> Bool {
+        let key = "menuBarHidden.\(providerKey(kind, slug))"
+        return UserDefaults.standard.object(forKey: key) == nil
+            || !UserDefaults.standard.bool(forKey: key)
+    }
+
+    private func setProviderShownInMenuBar(_ kind: GatewayKind, _ slug: String, _ shown: Bool) {
+        UserDefaults.standard.set(!shown, forKey: "menuBarHidden.\(providerKey(kind, slug))")
+    }
+
+    @objc private func toggleProviderMenuBar(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue else { return }
+        let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2, let kind = GatewayKind(rawValue: parts[0]) else { return }
+        setProviderShownInMenuBar(kind, parts[1], !providerShownInMenuBar(kind, parts[1]))
+        updateStatusItem()
+        rebuildMenu()
     }
 
     @objc private func openGateway() {
