@@ -20,7 +20,7 @@
 set -euo pipefail
 exec /usr/bin/env python3 - "$@" <<'PY'
 import base64, json, os, subprocess, sys, time, urllib.request, urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HOME = Path.home()
@@ -210,20 +210,38 @@ def codex_provider():
         used = window.get("used_percent")
         if used is None:
             continue
+        # Label by the window's own length when the API gives it (18000s ≈ the ~5h
+        # session, 604800s = the weekly allowance); fall back to key/reset distance.
+        window_seconds = window.get("limit_window_seconds")
+        if isinstance(window_seconds, (int, float)):
+            wlabel = "Weekly" if window_seconds > 2 * 86400 else "Session"
+        else:
+            wlabel = "Session" if key == "primary_window" else "Weekly"
+        # `reset_at` is a Unix timestamp (Hermes reports an ISO instant, so convert
+        # to match); also accept an ISO string, or derive from reset_after_seconds.
         reset_at = window.get("reset_at")
-        wlabel = "Session" if key == "primary_window" else "Weekly"
-        # The API conveys the window length only via reset distance; a reset more
-        # than ~2 days out is the weekly allowance, otherwise the ~5h session.
-        parsed = None
-        if isinstance(reset_at, str) and reset_at:
+        resets_iso = None
+        if isinstance(reset_at, bool):
+            pass
+        elif isinstance(reset_at, (int, float)) and reset_at > 0:
+            resets_iso = datetime.fromtimestamp(reset_at, timezone.utc).isoformat()
+        elif isinstance(reset_at, str) and reset_at:
             try:
-                parsed = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+                resets_iso = datetime.fromisoformat(reset_at.replace("Z", "+00:00")).isoformat()
             except Exception:
-                parsed = None
-        if parsed is not None:
-            now = datetime.now(parsed.tzinfo or timezone.utc)
-            wlabel = "Weekly" if (parsed - now).total_seconds() > 2 * 86400 else "Session"
-        windows.append(_window(wlabel, used, resets_at=reset_at if isinstance(reset_at, str) else None))
+                resets_iso = None
+        if resets_iso is None:
+            after = window.get("reset_after_seconds")
+            if isinstance(after, (int, float)) and after > 0:
+                resets_iso = (datetime.now(timezone.utc) + timedelta(seconds=after)).isoformat()
+        # A reset distance still lets us label the window even without limit length.
+        if not isinstance(window_seconds, (int, float)) and resets_iso:
+            try:
+                secs = (datetime.fromisoformat(resets_iso) - datetime.now(timezone.utc)).total_seconds()
+                wlabel = "Weekly" if secs > 2 * 86400 else "Session"
+            except Exception:
+                pass
+        windows.append(_window(wlabel, used, resets_at=resets_iso))
     details = []
     reset_credits = payload.get("rate_limit_reset_credits") or {}
     banked = reset_credits.get("available_count")
