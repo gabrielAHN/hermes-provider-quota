@@ -756,9 +756,30 @@ final class ActivityPetsView: NSView {
                 let highlight = mark.busy && index == phase % max(n, 1)
                 let pulse: CGFloat = mark.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(index)) + 1) * 0.5) : 0
                 let size = dotSize + (highlight ? 1.0 : 0) + pulse
-                let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
-                (NSColor(activityHex: mark.hex) ?? .hermesBlue).withAlphaComponent(mark.busy ? 1 : 0.55).setFill()
-                dot.fill()
+                let rect = NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size)
+                let dot = NSBezierPath(ovalIn: rect)
+                let alpha: CGFloat = mark.busy ? 1 : 0.55
+                // A session may run MULTIPLE models (e.g. mixture-of-agents): its
+                // colour is a comma-joined list of the model families it's running.
+                // One colour → solid dot; several → equal pie wedges, one per model.
+                let colors = mark.hex.split(separator: ",").map { NSColor(activityHex: String($0)) ?? .hermesBlue }
+                if colors.count <= 1 {
+                    (colors.first ?? .hermesBlue).withAlphaComponent(alpha).setFill()
+                    dot.fill()
+                } else {
+                    let center = NSPoint(x: rect.midX, y: rect.midY)
+                    let sweep = 360.0 / CGFloat(colors.count)
+                    for (i, color) in colors.enumerated() {
+                        let wedge = NSBezierPath()
+                        wedge.move(to: center)
+                        wedge.appendArc(withCenter: center, radius: size / 2,
+                                        startAngle: CGFloat(i) * sweep - 90,
+                                        endAngle: CGFloat(i + 1) * sweep - 90)
+                        wedge.close()
+                        color.withAlphaComponent(alpha).setFill()
+                        wedge.fill()
+                    }
+                }
                 NSColor.white.withAlphaComponent(0.85).setStroke()
                 dot.lineWidth = 0.75
                 dot.stroke()
@@ -1944,6 +1965,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Replace (or insert) one source, keeping the Hermes-before-Local order.
     private func upsertSource(_ source: SourceQuota) {
+        // Drop a result for a source disabled while its fetch was in flight — it
+        // must not re-add that source's dots after the user turned it off.
+        guard gatewayEnabled(source.kind) else {
+            sources.removeAll { $0.kind == source.kind }
+            return
+        }
         if let index = sources.firstIndex(where: { $0.kind == source.kind }) {
             sources[index] = source
         } else {
@@ -2196,16 +2223,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         guard let lastActive, now - lastActive < hermesSessionFreshWindow else { continue }
                     }
                 }
-                // Colour by the SESSION's provider. The helper (--activity) already
-                // resolves this per session by MODEL family — Claude / Codex /
-                // OpenRouter — and passes it in `billing_provider` (model isn't sent
-                // once resolved). sessionHex maps that to a colour, and still applies
-                // the model-family rules itself if a raw model ever comes through.
-                // One colour PER running session → N sessions, N dots.
-                hexes.append(sessionHex(
-                    billing: session["billing_provider"] as? String,
-                    provider: session["provider"] as? String,
-                    model: session["model"] as? String))
+                // Colour by the SESSION's provider(s). The helper passes `providers`
+                // — the DISTINCT model families the session is running; a
+                // mixture-of-agents session runs several. Join their colours so the
+                // pet draws ONE dot per session, split into a wedge per model. Fall
+                // back to the single resolved provider (billing_provider/model) when
+                // there's just one. One (possibly multi-colour) dot per session.
+                let families = (session["providers"] as? [String])?.filter { !$0.isEmpty } ?? []
+                if !families.isEmpty {
+                    var seen = Set<String>()
+                    var hs: [String] = []
+                    for f in families {
+                        let h = sessionHex(billing: f, provider: nil, model: nil)
+                        if seen.insert(h).inserted { hs.append(h) }
+                    }
+                    hexes.append(hs.joined(separator: ","))
+                } else {
+                    hexes.append(sessionHex(
+                        billing: session["billing_provider"] as? String,
+                        provider: session["provider"] as? String,
+                        model: session["model"] as? String))
+                }
             }
         }
         let busy = statusBusy || !hexes.isEmpty
@@ -2587,7 +2625,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         built.append(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
                     }
                 }
-                self.sources = built
+                // Keep only sources still enabled at completion — a source disabled
+                // while this fetch was in flight must not reappear (the toggle-off lag).
+                self.sources = built.filter { self.gatewayEnabled($0.kind) }
                 self.activating.removeAll()   // data landed → clear the spinners
                 self.updateStatusItem()
                 self.rebuildMenu()

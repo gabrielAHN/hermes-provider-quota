@@ -233,12 +233,24 @@ if ENDPOINT == "--activity":
         active = bool(s.get("is_active"))
         if active:
             status_busy = True
+        # A session can run MULTIPLE models — resolve each to its provider family
+        # (distinct, in order) so the pet draws one dot split into a wedge per
+        # model. Fall back to the single resolved provider when there's just one.
+        families = []
+        for m in (s.get("models") or []):
+            fam = _dot_provider({"model": m})
+            if fam and fam not in families:
+                families.append(fam)
+        if not families:
+            fam = _dot_provider(s)
+            families = [fam] if fam else []
         out.append({
             "is_active": active,
             "ended_at": s.get("ended_at"),
             "last_active": time.time() if active else s.get("last_active"),
             "billing_provider": _dot_provider(s),
             "provider": s.get("provider"),
+            "providers": families,
         })
     emit(json.dumps({"agents": 0, "status_busy": status_busy, "sessions": out}).encode())
     sys.exit(0)
