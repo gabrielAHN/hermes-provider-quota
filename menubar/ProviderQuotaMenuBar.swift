@@ -737,52 +737,50 @@ final class ActivityPetsView: NSView {
         // dot per session in its provider colour — bright while busy, dim while
         // idle — or a green check for a session that just finished.
         if !tile.sessions.isEmpty {
-            let marks = Array(tile.sessions.prefix(8))
-            let n = marks.count
+            // Each session is a GROUP of small dots — one per model it's running (a
+            // session can use several: mixture-of-agents / fallback / switch) —
+            // packed tightly, with a wider gap BETWEEN sessions. So two models in
+            // one session read as a pair sitting together, distinct from a second
+            // session's dots. Total dots capped so the row fits under the pet.
             let dotSize: CGFloat = 6
-            let spacing: CGFloat = n > 5 ? 7.5 : 9
-            let span = CGFloat(n - 1) * spacing
-            let startX = tileRect.midX - span / 2
+            let innerGap: CGFloat = 1.5   // between models within a session
+            let groupGap: CGFloat = 6     // between sessions
             let cy = tileRect.minY + 7
-            let pill = NSRect(x: startX - dotSize / 2 - 4, y: cy - 6.5, width: span + dotSize + 8, height: 13)
-            let pillPath = NSBezierPath(roundedRect: pill, xRadius: 6.5, yRadius: 6.5)
+            var groups: [(colors: [NSColor], busy: Bool)] = []
+            var total = 0
+            for mark in tile.sessions {
+                var colors = mark.hex.split(separator: ",").compactMap { NSColor(activityHex: String($0)) }
+                if colors.isEmpty { colors = [.hermesBlue] }
+                if !groups.isEmpty && total + colors.count > 7 { break }
+                groups.append((colors, mark.busy))
+                total += colors.count
+                if total >= 7 { break }
+            }
+            func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
+            let totalW = groups.reduce(CGFloat(0)) { $0 + groupW($1.colors.count) }
+                + CGFloat(max(0, groups.count - 1)) * groupGap
+            let pill = NSRect(x: tileRect.midX - totalW / 2 - 4, y: cy - 6.5, width: totalW + 8, height: 13)
             NSColor.black.withAlphaComponent(0.4).setFill()
-            pillPath.fill()
-            for (index, mark) in marks.enumerated() {
-                let cx = startX + CGFloat(index) * spacing
-                // One dot per RUNNING session, in its provider's colour. A session
-                // only appears here while it's live, so there's no finished state to
-                // draw — the dot just disappears when the session ends.
-                let highlight = mark.busy && index == phase % max(n, 1)
-                let pulse: CGFloat = mark.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(index)) + 1) * 0.5) : 0
+            NSBezierPath(roundedRect: pill, xRadius: 6.5, yRadius: 6.5).fill()
+
+            var x = tileRect.midX - totalW / 2   // left edge of the first dot
+            for (gi, group) in groups.enumerated() {
+                let alpha: CGFloat = group.busy ? 1 : 0.55
+                let highlight = group.busy && gi == phase % max(groups.count, 1)
+                let pulse: CGFloat = group.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(gi)) + 1) * 0.5) : 0
                 let size = dotSize + (highlight ? 1.0 : 0) + pulse
-                let rect = NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size)
-                let dot = NSBezierPath(ovalIn: rect)
-                let alpha: CGFloat = mark.busy ? 1 : 0.55
-                // A session may run MULTIPLE models (e.g. mixture-of-agents): its
-                // colour is a comma-joined list of the model families it's running.
-                // One colour → solid dot; several → equal pie wedges, one per model.
-                let colors = mark.hex.split(separator: ",").map { NSColor(activityHex: String($0)) ?? .hermesBlue }
-                if colors.count <= 1 {
-                    (colors.first ?? .hermesBlue).withAlphaComponent(alpha).setFill()
+                for color in group.colors {
+                    let cx = x + dotSize / 2
+                    let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
+                    color.withAlphaComponent(alpha).setFill()
                     dot.fill()
-                } else {
-                    let center = NSPoint(x: rect.midX, y: rect.midY)
-                    let sweep = 360.0 / CGFloat(colors.count)
-                    for (i, color) in colors.enumerated() {
-                        let wedge = NSBezierPath()
-                        wedge.move(to: center)
-                        wedge.appendArc(withCenter: center, radius: size / 2,
-                                        startAngle: CGFloat(i) * sweep - 90,
-                                        endAngle: CGFloat(i + 1) * sweep - 90)
-                        wedge.close()
-                        color.withAlphaComponent(alpha).setFill()
-                        wedge.fill()
-                    }
+                    NSColor.white.withAlphaComponent(0.85).setStroke()
+                    dot.lineWidth = 0.75
+                    dot.stroke()
+                    x += dotSize + innerGap
                 }
-                NSColor.white.withAlphaComponent(0.85).setStroke()
-                dot.lineWidth = 0.75
-                dot.stroke()
+                x -= innerGap       // drop the trailing inner gap
+                x += groupGap       // wider gap before the next session
             }
         }
 
