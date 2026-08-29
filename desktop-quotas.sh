@@ -228,7 +228,7 @@ if ENDPOINT == "--activity":
     # session gets a fresh last_active so the client lights it; model → colour.
     out = []
     status_busy = False
-    act = _soft(get_json)("/api/plugins/session-activity/activity") or {}
+    act = _soft(get_json)("/api/plugins/provider-quota/activity") or {}
     for s in act.get("sessions") or []:
         active = bool(s.get("is_active"))
         if active:

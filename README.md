@@ -27,18 +27,16 @@ as **Disconnected**. Hermes has a gateway session, so it gets **Login** /
 
 ## How it works
 
-- **`dashboard/`** — the **`provider-quota`** gateway plugin, serving
-  `/api/plugins/provider-quota/quotas` (and `/pets`). It reads each provider's
-  usage from the credentials already in the gateway session, so it stays linked to
-  the gateway it's installed in. The provider set is **configurable per gateway**
-  so anyone can reuse it — see below.
-- **`session-activity/`** — a second gateway plugin, serving
-  `/api/plugins/session-activity/activity`: the Hermes turns RUNNING right now
-  (Desktop chats/bots and `tui_gateway` turns — which REST never marks
-  `is_active`), each with its model so the pet colours it per provider. It reads
-  only the gateway's own logs + active-sessions registry (no session DB / internals),
-  so it needs no privileged capabilities and stays enabled. Both plugins install
-  together (`install.sh`).
+- **`dashboard/`** — the **`provider-quota`** gateway plugin (one plugin, two
+  endpoints):
+  - `/api/plugins/provider-quota/quotas` — each provider's usage, read from the
+    credentials already in the gateway session (stays linked to the gateway it's
+    installed in; provider set **configurable per gateway** — see below). Also `/pets`.
+  - `/api/plugins/provider-quota/activity` — the Hermes turns RUNNING right now
+    (Desktop chats/bots and `tui_gateway` turns, which REST never marks
+    `is_active`), each with its model so the pet colours it per provider. Reads
+    only the gateway's own logs + active-sessions registry (no session DB /
+    internals), so it needs no privileged capabilities and stays enabled.
 - **`menubar/`** — the macOS menu-bar app. Every 60s it runs `desktop-quotas.sh`,
   which resolves the gateway your Hermes **Desktop** is bound to and fetches the
   endpoint. Portable (system `python3` + `openssl`), no extra deps.
@@ -63,7 +61,7 @@ pet shows a "not working" state (red halo + `!`).
 On the machine running your Hermes gateway:
 
 ```bash
-./install.sh      # install + enable BOTH plugins (provider-quota + session-activity),
+./install.sh      # install + enable the provider-quota plugin (quotas + activity),
                   # then restart the dashboard to load the routes
 ./verify.sh       # smoke-test the endpoint
 ```

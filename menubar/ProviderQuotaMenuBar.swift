@@ -1685,11 +1685,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
         // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar just has Close.
+        // bottom bar has Check-for-Updates and Close.
+        let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
+                                      label: "Check for Updates (pull latest from the repo)",
+                                      action: #selector(checkForUpdates), glowColor: .hermesBlue)
+        update.frame = NSRect(x: 282, y: 7, width: 28, height: 28)
+        view.addSubview(update)
+
         let close = iconActionButton(NSImage(systemSymbolName: "xmark", accessibilityDescription: nil), label: "Close Provider Quotas", action: #selector(quit), glowColor: .hermesRed)
         close.frame = NSRect(x: 314, y: 7, width: 28, height: 28)
         view.addSubview(close)
         return view
+    }
+
+    // Where this app was installed from (a git checkout of the repo), recorded by
+    // install-menubar.sh so "Check for Updates" knows what to pull + rebuild.
+    private func sourceRepoPath() -> String? {
+        if let p = UserDefaults.standard.string(forKey: "sourceRepo"),
+           FileManager.default.fileExists(atPath: p + "/update.sh") {
+            return p
+        }
+        return nil
+    }
+
+    private static func git() -> String {
+        for p in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] where FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return "/usr/bin/git"
+    }
+
+    @discardableResult
+    private static func run(_ launch: String, _ args: [String], cwd: String? = nil) -> (code: Int32, out: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launch)
+        proc.arguments = args
+        if let cwd { proc.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch { return (-1, "\(error)") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    // Check the repo this app was installed from for newer commits; if behind,
+    // offer to pull the latest and reinstall (rebuilds + relaunches the app). The
+    // update runs DETACHED so it survives the app being booted out mid-reinstall.
+    @objc private func checkForUpdates() {
+        guard let repo = sourceRepoPath() else {
+            Self.notify("Update unavailable", "Reinstall from a git clone of the repo (run install-menubar.sh) to enable in-app updates.")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let git = Self.git()
+            let fetch = Self.run(git, ["-C", repo, "fetch", "--quiet"])
+            if fetch.code != 0 {
+                DispatchQueue.main.async { Self.notify("Update check failed", fetch.out.isEmpty ? "git fetch failed" : fetch.out) }
+                return
+            }
+            let behind = Int(Self.run(git, ["-C", repo, "rev-list", "--count", "HEAD..@{u}"]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            DispatchQueue.main.async {
+                if behind == 0 {
+                    Self.notify("Up to date", "You're on the latest version.")
+                    return
+                }
+                let alert = NSAlert()
+                alert.messageText = "Update available"
+                alert.informativeText = "\(behind) new commit\(behind == 1 ? "" : "s") on the repo. Pull the latest and reinstall now? The app will rebuild and relaunch."
+                alert.addButton(withTitle: "Update")
+                alert.addButton(withTitle: "Later")
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn {
+                    // Detached: install-menubar.sh boots this app out and back in, so
+                    // it must not be a child of this process.
+                    Self.run("/bin/sh", ["-c", "nohup bash \(Self.shellQuote(repo))/update.sh >/tmp/provider-quotas-update.log 2>&1 &"])
+                    Self.notify("Updating…", "Pulling the latest and reinstalling — the menu-bar app will relaunch shortly.")
+                }
+            }
+        }
+    }
+
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func notify(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func rebuildMenu() {

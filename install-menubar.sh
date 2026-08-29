@@ -8,7 +8,11 @@ plist_target="$HOME/Library/LaunchAgents/io.github.gabrielahn.provider-quotas.pl
 launch_target="gui/$(id -u)"
 label="io.github.gabrielahn.provider-quotas"
 
-# Also install the gateway plugins this app reads — provider-quota (quota) AND
+# Record where we installed from so the app's "Check for Updates" can `git pull`
+# this checkout and rebuild (update.sh). No-op for non-git installs.
+defaults write "$label" sourceRepo "$service_home" 2>/dev/null || true
+
+# Also install the gateway plugin this app reads — provider-quota (quota) AND
 # session-activity (live sessions) — so a fresh menu install sets up BOTH
 # endpoints. Best-effort: only when a Hermes gateway is present on THIS machine.
 # For a REMOTE gateway, run install.sh on the gateway host instead.

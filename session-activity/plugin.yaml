@@ -1,9 +1,0 @@
-name: session-activity
-version: 1.0.0
-description: Live Hermes session/activity broker — reports running turns (incl. tui_gateway) with their model, for the Provider Quotas menu-bar pet
-author: gabrielAHN
-kind: standalone
-platforms:
-  - macos
-# Reads only the gateway's own logs + active-sessions registry (no session DB or
-# web_server internals), so it needs no privileged capabilities and stays enabled.
