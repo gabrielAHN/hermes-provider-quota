@@ -744,7 +744,7 @@ final class ActivityPetsView: NSView {
             // session's dots. Total dots capped so the row fits under the pet.
             let dotSize: CGFloat = 6
             let innerGap: CGFloat = 1.5   // between models within a session
-            let groupGap: CGFloat = 6     // between sessions
+            let groupGap: CGFloat = 9     // between session capsules
             let cy = tileRect.minY + 7
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
@@ -759,12 +759,20 @@ final class ActivityPetsView: NSView {
             func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
             let totalW = groups.reduce(CGFloat(0)) { $0 + groupW($1.colors.count) }
                 + CGFloat(max(0, groups.count - 1)) * groupGap
-            let pill = NSRect(x: tileRect.midX - totalW / 2 - 4, y: cy - 6.5, width: totalW + 8, height: 13)
-            NSColor.black.withAlphaComponent(0.4).setFill()
-            NSBezierPath(roundedRect: pill, xRadius: 6.5, yRadius: 6.5).fill()
-
-            var x = tileRect.midX - totalW / 2   // left edge of the first dot
+            var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
             for (gi, group) in groups.enumerated() {
+                let gw = groupW(group.colors.count)
+                // A rounded background border around THIS session's dots, so the
+                // model(s) it runs read as one bounded group.
+                let pad: CGFloat = 2.5
+                let cap = NSRect(x: x - pad, y: cy - 6.5, width: gw + pad * 2, height: 13)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: 6.5, yRadius: 6.5)
+                NSColor.black.withAlphaComponent(0.4).setFill()
+                capPath.fill()
+                NSColor.white.withAlphaComponent(0.35).setStroke()
+                capPath.lineWidth = 0.75
+                capPath.stroke()
+
                 let alpha: CGFloat = group.busy ? 1 : 0.55
                 let highlight = group.busy && gi == phase % max(groups.count, 1)
                 let pulse: CGFloat = group.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(gi)) + 1) * 0.5) : 0
@@ -780,7 +788,7 @@ final class ActivityPetsView: NSView {
                     x += dotSize + innerGap
                 }
                 x -= innerGap       // drop the trailing inner gap
-                x += groupGap       // wider gap before the next session
+                x += groupGap       // wider gap before the next session's capsule
             }
         }
 
