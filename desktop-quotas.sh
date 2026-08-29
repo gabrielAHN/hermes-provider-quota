@@ -19,6 +19,11 @@ SUPPORT = Path.home() / "Library/Application Support/Hermes"
 # body is written to stdout.
 ENDPOINT = sys.argv[1] if len(sys.argv) > 1 else "/api/plugins/provider-quota/quotas?refresh=true"
 OUT = sys.argv[2] if len(sys.argv) > 2 else None
+# Activity polls run on the menu-bar's 1s timer and only read session lists, so a
+# slow gateway call must fail FAST — a 20s hang would stall the in-flight guard
+# and make a session's dot appear (or clear) many seconds late. Quota fetches hit
+# slow provider APIs, so they keep the generous timeout.
+TIMEOUT = 6 if ENDPOINT == "--activity" else 20
 
 
 def fail(msg):
@@ -59,7 +64,7 @@ def http_get(url, headers):
     hdrs.setdefault("User-Agent", _USER_AGENT)
     req = urllib.request.Request(url, headers=hdrs)
     try:
-        with _opener.open(req, timeout=20) as resp:
+        with _opener.open(req, timeout=TIMEOUT) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, b""
@@ -182,24 +187,60 @@ def get_json(path):
 # app decide what's "running". Never fails: a signed-out gateway just yields an
 # empty summary so the pet quietly stays idle. ---
 if ENDPOINT == "--activity":
-    st = get_json("/api/status") or {}
-    profiles = st.get("profiles") or []
-    agents = st.get("active_agents") or 0
-    status_busy = (bool(st.get("gateway_busy"))
-                   or agents > 0
-                   or (st.get("active_sessions") or 0) > 0)
+    import re, time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _dot_provider(s):
+        # Colour the pet's dot by the MODEL FAMILY the user reasons about — Claude
+        # vs Codex vs OpenRouter — resolved from `model`, which is populated from
+        # the moment a session starts. We do NOT lead with `billing_provider`: it's
+        # only stamped by usage accounting AFTER the first response (null on early
+        # and failed turns → grey), and for a Claude model served through Copilot it
+        # reads "copilot-acp" → wrong colour. OpenRouter serves "vendor/model" slugs
+        # (qwen/…, deepseek/…, anthropic/…, openai/…), so ANY "/" means OpenRouter.
+        # Fall back to billing_provider / provider only when the family is unknown.
+        model = (s.get("model") or "").lower()
+        if model:
+            if "/" in model:
+                return "openrouter"
+            if model.startswith("claude"):
+                return "anthropic"
+            if model.startswith("gpt") or "codex" in model or model.startswith(("o1", "o3", "o4")):
+                return "openai-codex"
+        return s.get("billing_provider") or s.get("provider") or ""
+
+    def _soft(getter):
+        # A source that's down/signed-out must NOT kill the scan — we merge whatever
+        # sources ARE up. (http_get fail()s hard via sys.exit on a dead gateway.)
+        def g(path):
+            try:
+                return getter(path)
+            except SystemExit:
+                return None
+            except Exception:
+                return None
+        return g
+
+    # Sessions come from the ONE provider-quota plugin's /activity endpoint, which
+    # aggregates the session store + tui_gateway logs + active-sessions registry
+    # SERVER-SIDE (per provider). The client reads sessions from that single plugin
+    # over the Desktop/gateway connection instead of scanning REST itself. An active
+    # session gets a fresh last_active so the client lights it; model → colour.
     out = []
-    for profile in profiles:
-        data = get_json("/api/sessions?profile=%s&limit=10" % profile) or {}
-        for s in (data.get("sessions") or []):
-            out.append({
-                "is_active": s.get("is_active"),
-                "ended_at": s.get("ended_at"),
-                "last_active": s.get("last_active"),
-                "billing_provider": s.get("billing_provider"),
-                "provider": s.get("provider"),
-            })
-    emit(json.dumps({"agents": agents, "status_busy": status_busy, "sessions": out}).encode())
+    status_busy = False
+    act = _soft(get_json)("/api/plugins/provider-quota/activity") or {}
+    for s in act.get("sessions") or []:
+        active = bool(s.get("is_active"))
+        if active:
+            status_busy = True
+        out.append({
+            "is_active": active,
+            "ended_at": s.get("ended_at"),
+            "last_active": time.time() if active else s.get("last_active"),
+            "billing_provider": _dot_provider(s),
+            "provider": s.get("provider"),
+        })
+    emit(json.dumps({"agents": 0, "status_busy": status_busy, "sessions": out}).encode())
     sys.exit(0)
 
 # --- Normal single-endpoint mode. ---

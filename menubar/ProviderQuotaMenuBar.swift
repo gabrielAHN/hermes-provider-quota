@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SQLite3
 
 struct QuotaPayload: Decodable {
     let generatedAt: String
@@ -1013,10 +1014,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateActivityPets()
         }
-        // Poll the Hermes gateway a bit slower than local (it's a network call),
-        // but often enough that a finished session's dot clears promptly.
+        // Poll the Hermes gateway often (the helper's --activity round-trip is
+        // ~0.3s), so a short turn's dot APPEARS and CLEARS promptly instead of
+        // being missed between sparse polls (the "OpenRouter point never showed"
+        // symptom — a fast turn can start and finish inside a 2s gap once poll
+        // phase and a slow round-trip line up).
         pollHermesActivity()
-        hermesActivityTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        hermesActivityTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.pollHermesActivity()
         }
         signal(SIGUSR1, SIG_IGN)
@@ -1347,6 +1351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "anthropic", "claude", "claude-sub":          return "anthropic"
         case "openai-codex", "codex", "openai", "chatgpt": return "openai-codex"
         case "openrouter":                                 return "openrouter"
+        case "opencode":                                   return "opencode"
         case "copilot", "copilot-acp", "github-copilot":   return "copilot"
         default:                                           return slug.lowercased()
         }
@@ -1355,6 +1360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static func providerHex(_ slug: String) -> String {
         switch normalizedProvider(slug) {
         case "openrouter":   return "#8e1afe"   // purple
+        case "opencode":     return "#38bdf8"   // sky blue (opencode's own OpenRouter key)
         case "anthropic":    return "#d97757"   // orange
         case "openai-codex": return "#10a37f"   // green
         case "copilot":      return "#6e7681"   // grey
@@ -1365,6 +1371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     static func providerLabel(_ slug: String) -> String {
         switch normalizedProvider(slug) {
         case "openrouter":   return "OpenRouter"
+        case "opencode":     return "opencode"
         case "anthropic":    return "Claude"
         case "openai-codex": return "Codex"
         default:             return slug.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ").capitalized
@@ -1374,6 +1381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerSymbolName(_ provider: String) -> String {
         switch Self.normalizedProvider(provider) {
         case "openrouter": return "arrow.triangle.branch"
+        case "opencode":   return "terminal"
         case "anthropic":  return "sparkles"
         default:           return "chevron.left.forwardslash.chevron.right"   // Codex / other
         }
@@ -1444,7 +1452,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
-        if provider.provider == "openrouter",
+        // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
+        // carry a single "Account credits" window — summarise it as an amount.
+        if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)),
            let account = provider.windows.first(where: { $0.label == "Account credits" }),
            let amount = account.remainingAmount {
             return "\(formattedAmount(amount, currency: account.currency)) available"
@@ -1675,11 +1685,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
         // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar just has Close.
+        // bottom bar has Check-for-Updates and Close.
+        let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
+                                      label: "Check for Updates (pull latest from the repo)",
+                                      action: #selector(checkForUpdates), glowColor: .hermesBlue)
+        update.frame = NSRect(x: 282, y: 7, width: 28, height: 28)
+        view.addSubview(update)
+
         let close = iconActionButton(NSImage(systemSymbolName: "xmark", accessibilityDescription: nil), label: "Close Provider Quotas", action: #selector(quit), glowColor: .hermesRed)
         close.frame = NSRect(x: 314, y: 7, width: 28, height: 28)
         view.addSubview(close)
         return view
+    }
+
+    // Where this app was installed from (a git checkout of the repo), recorded by
+    // install-menubar.sh so "Check for Updates" knows what to pull + rebuild.
+    private func sourceRepoPath() -> String? {
+        if let p = UserDefaults.standard.string(forKey: "sourceRepo"),
+           FileManager.default.fileExists(atPath: p + "/update.sh") {
+            return p
+        }
+        return nil
+    }
+
+    private static func git() -> String {
+        for p in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] where FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return "/usr/bin/git"
+    }
+
+    @discardableResult
+    private static func run(_ launch: String, _ args: [String], cwd: String? = nil) -> (code: Int32, out: String) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: launch)
+        proc.arguments = args
+        if let cwd { proc.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do { try proc.run() } catch { return (-1, "\(error)") }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return (proc.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+    }
+
+    // Check the repo this app was installed from for newer commits; if behind,
+    // offer to pull the latest and reinstall (rebuilds + relaunches the app). The
+    // update runs DETACHED so it survives the app being booted out mid-reinstall.
+    @objc private func checkForUpdates() {
+        guard let repo = sourceRepoPath() else {
+            Self.notify("Update unavailable", "Reinstall from a git clone of the repo (run install-menubar.sh) to enable in-app updates.")
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let git = Self.git()
+            let fetch = Self.run(git, ["-C", repo, "fetch", "--quiet"])
+            if fetch.code != 0 {
+                DispatchQueue.main.async { Self.notify("Update check failed", fetch.out.isEmpty ? "git fetch failed" : fetch.out) }
+                return
+            }
+            let behind = Int(Self.run(git, ["-C", repo, "rev-list", "--count", "HEAD..@{u}"]).out
+                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            DispatchQueue.main.async {
+                if behind == 0 {
+                    Self.notify("Up to date", "You're on the latest version.")
+                    return
+                }
+                let alert = NSAlert()
+                alert.messageText = "Update available"
+                alert.informativeText = "\(behind) new commit\(behind == 1 ? "" : "s") on the repo. Pull the latest and reinstall now? The app will rebuild and relaunch."
+                alert.addButton(withTitle: "Update")
+                alert.addButton(withTitle: "Later")
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn {
+                    // Detached: install-menubar.sh boots this app out and back in, so
+                    // it must not be a child of this process.
+                    Self.run("/bin/sh", ["-c", "nohup bash \(Self.shellQuote(repo))/update.sh >/tmp/provider-quotas-update.log 2>&1 &"])
+                    Self.notify("Updating…", "Pulling the latest and reinstalling — the menu-bar app will relaunch shortly.")
+                }
+            }
+        }
+    }
+
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func notify(_ title: String, _ text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     private func rebuildMenu() {
@@ -2005,7 +2104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let helper = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/bin/hermes-desktop-quotas").path
         guard FileManager.default.isExecutableFile(atPath: helper) else {
-            return (desktopSessionStreaming(), 0, [])
+            return (false, 0, [])
         }
         // One helper call resolves the gateway once and returns /api/status plus
         // every profile's recent sessions (see desktop-quotas.sh --activity). We
@@ -2021,46 +2120,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusBusy = (obj["status_busy"] as? Bool) ?? false
             let now = Date().timeIntervalSince1970
             for session in (obj["sessions"] as? [[String: Any]]) ?? [] {
-                // `is_active` is the gateway's real "working right now" flag — it
-                // reads false for sessions that are merely open-but-idle (some
-                // linger with ended_at == null for days), so we lean on it. That
-                // means the dot clears the moment a turn ends, with no trailing
-                // lag. `last_active` within a SHORT window is only a bridge across
-                // poll timing (not a lingering tail); a cleanly-closed session
-                // (ended_at set) is never running. One colour PER running session,
-                // so N sessions → N dots (several of one provider → several dots).
-                let isActive = (session["is_active"] as? Bool) ?? false
-                let ended = session["ended_at"] != nil && !(session["ended_at"] is NSNull)
-                let lastActive = session["last_active"] as? Double
-                let recentlyActive = !ended && (lastActive.map { now - $0 < 4 } ?? false)
-                guard isActive || recentlyActive else { continue }
-                let provider = (session["billing_provider"] as? String)
-                    ?? (session["provider"] as? String) ?? ""
-                hexes.append(providerHex(provider))
+                // A session lights a dot while it's genuinely RUNNING.
+                //
+                // CLOSED (ended_at set) → DONE: show only for a short grace so an
+                // ephemeral turn (OpenRouter/CLI close the session the instant it
+                // ends) still registers, then clear promptly.
+                //
+                // OPEN (ended_at null) → live ONLY while the gateway marks it
+                // is_active. Verified: is_active flips False the instant a turn
+                // COMPLETES or is STOPPED, so gating on it clears a finished/stopped
+                // session that stays open (ended_at null) — the "pet didn't update
+                // after stop/complete" bug (it used to linger the full freshness
+                // window). last_active is only a BACKSTOP that reaps a zombie
+                // (killed mid-turn: is_active stuck True, last_active frozen). We do
+                // NOT use a tight last_active window for open sessions — the gateway
+                // may not bump last_active during a long generation, so is_active
+                // carries liveness while last_active only bounds zombies. If a
+                // gateway omits is_active, fall back to plain freshness.
+                let endedRaw = session["ended_at"]
+                let endedAt: Double? = (endedRaw is NSNull) ? nil : endedRaw as? Double
+                if let endedAt {
+                    guard now - endedAt < hermesEndedGrace else { continue }
+                } else {
+                    let lastActive = session["last_active"] as? Double
+                    if let isActive = session["is_active"] as? Bool {
+                        guard isActive, let lastActive, now - lastActive < hermesZombieWindow else { continue }
+                    } else {
+                        guard let lastActive, now - lastActive < hermesSessionFreshWindow else { continue }
+                    }
+                }
+                // Colour by the SESSION's provider. The helper (--activity) already
+                // resolves this per session by MODEL family — Claude / Codex /
+                // OpenRouter — and passes it in `billing_provider` (model isn't sent
+                // once resolved). sessionHex maps that to a colour, and still applies
+                // the model-family rules itself if a raw model ever comes through.
+                // One colour PER running session → N sessions, N dots.
+                hexes.append(sessionHex(
+                    billing: session["billing_provider"] as? String,
+                    provider: session["provider"] as? String,
+                    model: session["model"] as? String))
             }
         }
-        var busy = statusBusy || !hexes.isEmpty
-        // The Desktop app streams a chat by writing its Local Storage constantly
-        // (fresh within seconds ⇒ in progress); let that animate the pet as
-        // "working". We deliberately do NOT invent provider dots from the open
-        // chat tiles — dots must map to REAL running sessions (is_active). So
-        // merely having the Desktop active (e.g. while signing in) shows the pet
-        // working with no dots, instead of lighting up every open chat's provider.
-        if !busy { busy = desktopSessionStreaming() }
+        let busy = statusBusy || !hexes.isEmpty
         return (busy, agents, hexes)
     }
 
-    private static func desktopSessionStreaming() -> Bool {
-        let running = NSWorkspace.shared.runningApplications.contains {
-            $0.bundleIdentifier == "com.nousresearch.hermes" || $0.executableURL?.lastPathComponent == "Hermes"
+    // Provider colour for one gateway session. The --activity helper pre-resolves
+    // the provider from the model family and sends it as `billing`; map it here.
+    // If a raw `model` is present instead, resolve it the same way: OpenRouter
+    // serves "vendor/model" slugs (contain "/"); Codex models are gpt-*/o#/codex;
+    // Claude models are claude-*. Fall back to billing, then provider, then grey.
+    static func sessionHex(billing: String?, provider: String?, model: String?) -> String {
+        if let m = model?.lowercased(), !m.isEmpty {
+            if m.contains("/") { return providerHex("openrouter") }
+            if m.hasPrefix("claude") { return providerHex("anthropic") }
+            if m.hasPrefix("gpt") || m.contains("codex") || m.hasPrefix("o1") || m.hasPrefix("o3") || m.hasPrefix("o4") {
+                return providerHex("openai-codex")
+            }
         }
-        guard running else { return false }
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Hermes/Local Storage/leveldb")
-        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return false }
-        let newest = files.compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }.max()
-        guard let newest else { return false }
-        return Date().timeIntervalSince(newest) < 10
+        if let b = billing, !b.isEmpty { return providerHex(b) }
+        if let p = provider, !p.isEmpty { return providerHex(p) }
+        return providerHex("")   // neutral grey
     }
 
     // Poll the gateway for Hermes activity and cache it; refresh the pets when it
@@ -2081,14 +2201,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.hermesPollInFlight = false
-                let changed = self.hermesBusy != busy || self.hermesActiveAgents != agents || self.hermesSessionHexes != hexes
-                self.hermesBusy = busy
+                // Short bot/helper turns live only a few seconds — with a 2s poll
+                // timer plus a multi-request helper round-trip, a dot that clears
+                // the instant the turn ends is on screen for a single tick and
+                // reads as "never showed". HOLD the last-seen running dots for a
+                // short, bounded grace period after they disappear, so brief turns
+                // register while long-finished ones still clear automatically.
+                var effectiveHexes = hexes
+                var effectiveBusy = busy
+                if hexes.isEmpty,
+                   let until = self.hermesDotHoldUntil, Date() < until,
+                   !self.hermesHeldHexes.isEmpty {
+                    effectiveHexes = self.hermesHeldHexes
+                    effectiveBusy = true
+                }
+                if !hexes.isEmpty {
+                    self.hermesDotHoldUntil = Date().addingTimeInterval(Self.hermesDotHoldSeconds)
+                    self.hermesHeldHexes = hexes
+                }
+                let changed = self.hermesBusy != effectiveBusy || self.hermesActiveAgents != agents || self.hermesSessionHexes != effectiveHexes
+                self.hermesBusy = effectiveBusy
                 self.hermesActiveAgents = agents
-                self.hermesSessionHexes = hexes
+                self.hermesSessionHexes = effectiveHexes
                 if changed { self.updateActivityPets() }
             }
         }
     }
+
+    // Grace period that keeps the Hermes pet's last-seen session dots lit after a
+    // turn ends — smooths a single empty poll tick. Kept SMALL (the hermesEndedGrace
+    // window already keeps ephemeral turns visible); a big hold was the "pet keeps
+    // going after the turn ends" lag.
+    private static let hermesDotHoldSeconds: TimeInterval = 2
+    // How stale an OPEN session's last write may be while still counting as
+    // running. A live turn heartbeats every <=30s, so 75s spans two missed beats;
+    // open-but-idle sessions age out of the dots within about a minute.
+    private static let hermesSessionFreshWindow: TimeInterval = 75
+    // How long a CLOSED session (ended_at set) still lights a dot after it ends —
+    // long enough that an ephemeral turn registers and survives a poll/round-trip,
+    // short enough that the pet stops promptly when a turn completes.
+    private static let hermesEndedGrace: TimeInterval = 6
+    // Backstop for an OPEN session that's still is_active but whose last_active has
+    // frozen. is_active is the gateway's authoritative liveness flag (True while a
+    // turn runs, False the instant it completes/stops), and the gateway does NOT
+    // bump last_active during a long Desktop generation — so we must TRUST
+    // is_active and NOT clear a still-active session on last_active age (doing so
+    // blinked live Desktop turns off after ~2min). This window only reaps a
+    // pathological zombie (is_active stuck True after a hard crash); kept large so a
+    // genuinely long turn is never dropped. The gateway also reaps stale is_active
+    // itself (~300s), so this rarely bites.
+    private static let hermesZombieWindow: TimeInterval = 900
+    private var hermesDotHoldUntil: Date?
+    private var hermesHeldHexes: [String] = []
 
     private static func workingSourceInstance(name: String, title: String) -> ProviderActivityInstance {
         ProviderActivityInstance(
@@ -2107,17 +2271,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // clears it a bit after the session truly goes quiet. (Claude streams its
     // transcript continuously, so it keeps the tighter localBusyWindow.)
     private static let codexBusyWindow = 90.0
+    // opencode (OpenRouter) writes its SQLite store in bursts too: during model
+    // reasoning it can go a minute+ between writes — measured gaps up to ~90s
+    // mid-turn — so the 20s window blinked the dot off through every reasoning
+    // pause (the "OpenRouter session shows no dot in the pet" report). A wider
+    // window keeps a working opencode/OpenRouter session lit through those gaps
+    // and clears it a bit after the turn truly ends.
+    private static let opencodeBusyWindow = 120.0
 
     struct LocalSession { let key: String; let hex: String; let busy: Bool; let order: Int }
 
     // Local sessions currently RUNNING, across providers — a Claude Code session
-    // (its `claude` process is alive) or a Codex session (its rollout was written
-    // recently). `busy` = actively processing right now (its log is fresh within
+    // (its `claude` process is alive), a Codex session (its rollout was written
+    // recently), or an opencode session (its DB row was touched recently).
+    // `busy` = actively processing right now (its log is fresh within
     // that tool's write cadence — see localBusyWindow / codexBusyWindow);
-    // otherwise it's running-but-idle. Grouped Claude, then Codex.
+    // otherwise it's running-but-idle. Grouped Claude, then Codex, then opencode.
     private static func fetchLocalActivity() -> [LocalSession] {
         let now = Date()
-        return (claudeSessions(now: now) + codexSessions(now: now)).sorted { $0.order < $1.order }
+        return (claudeSessions(now: now) + codexSessions(now: now) + opencodeSessions(now: now)).sorted { $0.order < $1.order }
     }
 
     // Assistant `stop_reason` values that mean the turn is OVER (not waiting on a
@@ -2238,6 +2410,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static func flagValue(_ flag: String, in tokens: [String]) -> String? {
         guard let index = tokens.firstIndex(of: flag), index + 1 < tokens.count else { return nil }
         return tokens[index + 1]
+    }
+
+    // opencode has no long-lived per-session process to watch, so read its local
+    // store (system SQLite — opencode.db) directly: a session is running while its
+    // row's time_updated is fresh, and BUSY (mid-turn) while parts/messages are
+    // still streaming in — opencode persists every stream/tool event, so during a
+    // turn the newest write is seconds old (sub-4s observed), well inside
+    // localBusyWindow; the dot clears promptly once the turn ends. time_updated is
+    // epoch MILLISECONDS. Top-level sessions only (parent_id IS NULL) so subagent
+    // runs don't multiply dots. Fail-open everywhere: an absent store, a busy
+    // writer lock, or an unreadable WAL simply yields no dots for this tick.
+    private static func opencodeSessions(now: Date) -> [LocalSession] {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/share/opencode/opencode.db").path
+        guard FileManager.default.fileExists(atPath: path) else { return [] }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, db != nil else {
+            sqlite3_close(db)
+            return []
+        }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "SELECT id, time_updated FROM session WHERE parent_id IS NULL " +
+                  "ORDER BY time_updated DESC LIMIT 10"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        let hex = providerHex("opencode")
+        var out: [LocalSession] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            guard let cId = sqlite3_column_text(stmt, 0) else { continue }
+            let id = String(cString: cId)
+            let updated = sqlite3_column_double(stmt, 1) / 1000.0
+            let age = now.timeIntervalSince1970 - updated
+            // Rows come newest-first; anything older than the present window
+            // (and everything after it) is a long-closed session.
+            guard age >= 0, age < localPresentWindow else { break }
+            out.append(LocalSession(
+                key: "local:opencode:\(id)", hex: hex,
+                busy: age < opencodeBusyWindow, order: 2))
+        }
+        return out
     }
 
     // A "not working" pet: the error/struggling animation + red halo + "!" badge

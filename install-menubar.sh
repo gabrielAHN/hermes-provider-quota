@@ -8,6 +8,20 @@ plist_target="$HOME/Library/LaunchAgents/io.github.gabrielahn.provider-quotas.pl
 launch_target="gui/$(id -u)"
 label="io.github.gabrielahn.provider-quotas"
 
+# Record where we installed from so the app's "Check for Updates" can `git pull`
+# this checkout and rebuild (update.sh). No-op for non-git installs.
+defaults write "$label" sourceRepo "$service_home" 2>/dev/null || true
+
+# Also install the gateway plugin this app reads — provider-quota (quota) AND
+# session-activity (live sessions) — so a fresh menu install sets up BOTH
+# endpoints. Best-effort: only when a Hermes gateway is present on THIS machine.
+# For a REMOTE gateway, run install.sh on the gateway host instead.
+if command -v hermes >/dev/null 2>&1 && [ -d "$HOME/.hermes/plugins" ]; then
+    bash "$service_home/install.sh" || echo "  (gateway plugin install skipped)"
+else
+    echo "  (no local Hermes gateway detected — install plugins on the gateway host: bash install.sh)"
+fi
+
 mkdir -p "$app_target/Contents/MacOS" "$HOME/Library/LaunchAgents" "$HOME/.hermes/logs" "$HOME/.local/bin"
 # Data sources: the Hermes Desktop app's gateway API (desktop-quotas.sh), and a
 # gateway-agnostic fallback that queries each provider's usage API directly from

@@ -27,17 +27,26 @@ as **Disconnected**. Hermes has a gateway session, so it gets **Login** /
 
 ## How it works
 
-- **`dashboard/`** — the gateway plugin, serving `/api/plugins/provider-quota/quotas`
-  (and `/pets`). It reads each provider's usage from the credentials already in
-  the gateway session, so it stays linked to the gateway it's installed in. The
-  provider set is **configurable per gateway** so anyone can reuse it — see below.
+- **`dashboard/`** — the **`provider-quota`** gateway plugin (one plugin, two
+  endpoints):
+  - `/api/plugins/provider-quota/quotas` — each provider's usage, read from the
+    credentials already in the gateway session (stays linked to the gateway it's
+    installed in; provider set **configurable per gateway** — see below). Also `/pets`.
+  - `/api/plugins/provider-quota/activity` — the Hermes turns RUNNING right now
+    (Desktop chats/bots and `tui_gateway` turns, which REST never marks
+    `is_active`), each with its model so the pet colours it per provider. Reads
+    only the gateway's own logs + active-sessions registry (no session DB /
+    internals), so it needs no privileged capabilities and stays enabled.
 - **`menubar/`** — the macOS menu-bar app. Every 60s it runs `desktop-quotas.sh`,
   which resolves the gateway your Hermes **Desktop** is bound to and fetches the
   endpoint. Portable (system `python3` + `openssl`), no extra deps.
 - **`local-quotas.sh`** — the **Local** source. When Local is enabled it reads
   each provider's usage API directly from the credentials on this Mac: Claude
   from `~/.claude/.credentials.json` or the login Keychain, Codex from `~/.codex`
-  (or a Goose `chatgpt_codex` token), OpenRouter from `OPENROUTER_API_KEY`. A
+  (or a Goose `chatgpt_codex` token), OpenRouter from `OPENROUTER_API_KEY`, and
+  **opencode** from the OpenRouter key opencode itself authenticated with
+  (`~/.local/share/opencode/auth.json`) — shown as its own row with the same
+  credits data. A
   provider only appears if its credential exists locally. (Gemini/xAI have no
   simple usage API, so they're skipped.)
 - **`desktop/`** — optional Hermes Desktop sidebar page.
@@ -52,15 +61,20 @@ pet shows a "not working" state (red halo + `!`).
 On the machine running your Hermes gateway:
 
 ```bash
-./install.sh      # install + enable the plugin, then restart the dashboard
+./install.sh      # install + enable the provider-quota plugin (quotas + activity),
+                  # then restart the dashboard to load the routes
 ./verify.sh       # smoke-test the endpoint
 ```
 
 On your Mac:
 
 ```bash
-./install-menubar.sh
+./install-menubar.sh   # builds/installs the menu-bar app; if a Hermes gateway is
+                       # present on this same Mac it also runs install.sh for you
 ```
+
+For a **remote** gateway, run `install.sh` on the gateway host and
+`install-menubar.sh` on your Mac.
 
 ## Configuring providers (per gateway)
 
@@ -165,8 +179,8 @@ not run on iOS.
     stores no credentials of its own), with a **Hermes gateway** running the
     `provider-quota` plugin (`./install.sh` on the gateway host); **or**
   - **Local** — provider logins on this Mac: a Claude/Anthropic OAuth login
-    (`claude login`), a ChatGPT/Codex login (`~/.codex`), and/or
-    `OPENROUTER_API_KEY`.
+    (`claude login`), a ChatGPT/Codex login (`~/.codex`),
+    `OPENROUTER_API_KEY`, and/or an `opencode auth login` (OpenRouter).
 - Provider credentials for whichever gateway you use (you only see quota for the
   providers that are actually signed in): an OpenRouter API key, a
   Claude/Anthropic OAuth login, and/or a ChatGPT/Codex login.

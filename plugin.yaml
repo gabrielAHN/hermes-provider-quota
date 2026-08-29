@@ -1,6 +1,6 @@
 name: provider-quota
 version: 1.0.0
-description: Account-quota broker for your gateway's providers (defaults to OpenRouter, Claude, Codex)
+description: Provider quota + live-session broker for your gateway (quotas + activity; defaults to OpenRouter, Claude, Codex)
 author: gabrielAHN
 kind: standalone
 platforms:
