@@ -1133,7 +1133,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
         view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
-        if connected, provider.status == "ok", let minimum = providerMinimum(provider) {
+        // Bar tracks the collapsed %: the current-session window for %-based
+        // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
+        // existing bar via the min fallback.
+        if connected, provider.status == "ok",
+           let minimum = sessionRemainingPercent(provider) ?? providerMinimum(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
             track.layer?.cornerRadius = 3
@@ -1328,6 +1332,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         provider.windows.compactMap(\.remainingPercent).min()
     }
 
+    // The "current session" window — the short (~5h) window whose remaining % the
+    // COLLAPSED provider row shows (not the min across windows, which could be the
+    // weekly/total). Identify it by a "session" label (Codex "Session", Claude
+    // "Current session"), else the soonest-resetting window (a session resets
+    // before the weekly), else the only window.
+    private func sessionWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        if let s = provider.windows.first(where: { $0.label.lowercased().contains("session") }) {
+            return s
+        }
+        let dated = provider.windows.compactMap { w -> (QuotaWindow, Date)? in
+            parsedDate(w.resetsAt).map { (w, $0) }
+        }
+        if let soonest = dated.min(by: { $0.1 < $1.1 })?.0 {
+            return soonest
+        }
+        return provider.windows.first
+    }
+
+    // Remaining % of the current-session window (nil for amount-only providers
+    // like OpenRouter, whose collapsed row shows a $ amount instead).
+    private func sessionRemainingPercent(_ provider: QuotaProvider) -> Double? {
+        sessionWindow(provider)?.remainingPercent
+    }
+
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
         provider.status == "ok" && provider.windows.contains {
             ($0.remainingPercent.map { $0 <= 0 } ?? false) || ($0.remainingAmount.map { $0 <= 0 } ?? false)
@@ -1445,6 +1473,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return formatter.localizedString(for: soonest, relativeTo: Date())
     }
 
+    // Relative reset ("in 4h") for a single window's resets_at, e.g. the session
+    // window shown in the collapsed row.
+    private func relativeReset(_ resetsAt: String) -> String? {
+        guard let date = parsedDate(resetsAt), date > Date() else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
     private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
         // Per-provider status when the source is down, rather than repeating the
         // whole connection summary on every row.
@@ -1458,6 +1495,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let account = provider.windows.first(where: { $0.label == "Account credits" }),
            let amount = account.remainingAmount {
             return "\(formattedAmount(amount, currency: account.currency)) available"
+        }
+        // Collapsed row shows the CURRENT-SESSION window's % (not the min across
+        // windows) — and the reset time of that same session window, so the number
+        // and its reset match.
+        if let session = sessionWindow(provider), let pct = session.remainingPercent {
+            let base = pct <= 0 ? "No session quota" : "\(Int(pct.rounded()))% left"
+            if let resetsAt = session.resetsAt, let reset = relativeReset(resetsAt) {
+                return "\(base) · resets \(reset)"
+            }
+            return base
         }
         if let minimum = providerMinimum(provider) {
             let base = minimum <= 0 ? "No quota available" : "\(Int(minimum.rounded()))% left"
