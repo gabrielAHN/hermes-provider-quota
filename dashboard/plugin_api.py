@@ -363,14 +363,19 @@ def _registry_sessions(home: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _models_for(home: Path, sids: set[str]) -> dict[str, tuple[str, str]]:
+def _models_for(home: Path, sids: set[str]) -> dict[str, list[tuple[str, str]]]:
+    # All DISTINCT (model, provider) pairs each session ran, in first-seen order —
+    # a session can use several models (mixture-of-agents, fallback, model switch).
     if not sids:
         return {}
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, list[tuple[str, str]]] = {}
     for line in _tail_text(home / "logs" / "agent.log").splitlines():
         m = _RE_MODEL.search(line)
         if m and m.group(1) in sids:
-            out[m.group(1)] = (m.group(2), m.group(3))  # keep the latest
+            pair = (m.group(2), m.group(3))
+            lst = out.setdefault(m.group(1), [])
+            if pair not in lst:
+                lst.append(pair)
     return out
 
 
@@ -418,13 +423,15 @@ def activity() -> dict[str, Any]:
     models = _models_for(home, set(active))
     out = []
     for sid, info in active.items():
-        model, provider = models.get(sid, ("", ""))
+        pairs = models.get(sid, [])
+        model, provider = pairs[-1] if pairs else ("", "")   # primary = latest
         out.append({
             "session_id": sid,
             "surface": info.get("surface"),
             "started_at": info.get("started_at"),
-            "model": model,
+            "model": model,          # latest model (single-dot / back-compat)
             "provider": provider,
+            "models": [m for m, _ in pairs],   # every distinct model this session ran
             "is_active": True,
         })
     return {"broker": socket.gethostname(), "sessions": out}

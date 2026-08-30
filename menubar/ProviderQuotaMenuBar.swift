@@ -737,31 +737,58 @@ final class ActivityPetsView: NSView {
         // dot per session in its provider colour — bright while busy, dim while
         // idle — or a green check for a session that just finished.
         if !tile.sessions.isEmpty {
-            let marks = Array(tile.sessions.prefix(8))
-            let n = marks.count
+            // Each session is a GROUP of small dots — one per model it's running (a
+            // session can use several: mixture-of-agents / fallback / switch) —
+            // packed tightly, with a wider gap BETWEEN sessions. So two models in
+            // one session read as a pair sitting together, distinct from a second
+            // session's dots. Total dots capped so the row fits under the pet.
             let dotSize: CGFloat = 6
-            let spacing: CGFloat = n > 5 ? 7.5 : 9
-            let span = CGFloat(n - 1) * spacing
-            let startX = tileRect.midX - span / 2
+            let innerGap: CGFloat = 1.5   // between models within a session
+            let groupGap: CGFloat = 9     // between session capsules
             let cy = tileRect.minY + 7
-            let pill = NSRect(x: startX - dotSize / 2 - 4, y: cy - 6.5, width: span + dotSize + 8, height: 13)
-            let pillPath = NSBezierPath(roundedRect: pill, xRadius: 6.5, yRadius: 6.5)
-            NSColor.black.withAlphaComponent(0.4).setFill()
-            pillPath.fill()
-            for (index, mark) in marks.enumerated() {
-                let cx = startX + CGFloat(index) * spacing
-                // One dot per RUNNING session, in its provider's colour. A session
-                // only appears here while it's live, so there's no finished state to
-                // draw — the dot just disappears when the session ends.
-                let highlight = mark.busy && index == phase % max(n, 1)
-                let pulse: CGFloat = mark.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(index)) + 1) * 0.5) : 0
+            var groups: [(colors: [NSColor], busy: Bool)] = []
+            var total = 0
+            for mark in tile.sessions {
+                var colors = mark.hex.split(separator: ",").compactMap { NSColor(activityHex: String($0)) }
+                if colors.isEmpty { colors = [.hermesBlue] }
+                if !groups.isEmpty && total + colors.count > 7 { break }
+                groups.append((colors, mark.busy))
+                total += colors.count
+                if total >= 7 { break }
+            }
+            func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
+            let totalW = groups.reduce(CGFloat(0)) { $0 + groupW($1.colors.count) }
+                + CGFloat(max(0, groups.count - 1)) * groupGap
+            var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
+            for (gi, group) in groups.enumerated() {
+                let gw = groupW(group.colors.count)
+                // A rounded background border around THIS session's dots, so the
+                // model(s) it runs read as one bounded group.
+                let pad: CGFloat = 2.5
+                let cap = NSRect(x: x - pad, y: cy - 6.5, width: gw + pad * 2, height: 13)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: 6.5, yRadius: 6.5)
+                NSColor.black.withAlphaComponent(0.4).setFill()
+                capPath.fill()
+                NSColor.white.withAlphaComponent(0.35).setStroke()
+                capPath.lineWidth = 0.75
+                capPath.stroke()
+
+                let alpha: CGFloat = group.busy ? 1 : 0.55
+                let highlight = group.busy && gi == phase % max(groups.count, 1)
+                let pulse: CGFloat = group.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(gi)) + 1) * 0.5) : 0
                 let size = dotSize + (highlight ? 1.0 : 0) + pulse
-                let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
-                (NSColor(activityHex: mark.hex) ?? .hermesBlue).withAlphaComponent(mark.busy ? 1 : 0.55).setFill()
-                dot.fill()
-                NSColor.white.withAlphaComponent(0.85).setStroke()
-                dot.lineWidth = 0.75
-                dot.stroke()
+                for color in group.colors {
+                    let cx = x + dotSize / 2
+                    let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
+                    color.withAlphaComponent(alpha).setFill()
+                    dot.fill()
+                    NSColor.white.withAlphaComponent(0.85).setStroke()
+                    dot.lineWidth = 0.75
+                    dot.stroke()
+                    x += dotSize + innerGap
+                }
+                x -= innerGap       // drop the trailing inner gap
+                x += groupGap       // wider gap before the next session's capsule
             }
         }
 
@@ -1133,7 +1160,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
         view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
-        if connected, provider.status == "ok", let minimum = providerMinimum(provider) {
+        // Bar tracks the collapsed %: the current-session window for %-based
+        // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
+        // existing bar via the min fallback.
+        if connected, provider.status == "ok",
+           let minimum = sessionRemainingPercent(provider) ?? providerMinimum(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
             track.layer?.cornerRadius = 3
@@ -1328,6 +1359,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         provider.windows.compactMap(\.remainingPercent).min()
     }
 
+    // The "current session" window — the short (~5h) window whose remaining % the
+    // COLLAPSED provider row shows (not the min across windows, which could be the
+    // weekly/total). Identify it by a "session" label (Codex "Session", Claude
+    // "Current session"), else the soonest-resetting window (a session resets
+    // before the weekly), else the only window.
+    private func sessionWindow(_ provider: QuotaProvider) -> QuotaWindow? {
+        if let s = provider.windows.first(where: { $0.label.lowercased().contains("session") }) {
+            return s
+        }
+        let dated = provider.windows.compactMap { w -> (QuotaWindow, Date)? in
+            parsedDate(w.resetsAt).map { (w, $0) }
+        }
+        if let soonest = dated.min(by: { $0.1 < $1.1 })?.0 {
+            return soonest
+        }
+        return provider.windows.first
+    }
+
+    // Remaining % of the current-session window (nil for amount-only providers
+    // like OpenRouter, whose collapsed row shows a $ amount instead).
+    private func sessionRemainingPercent(_ provider: QuotaProvider) -> Double? {
+        sessionWindow(provider)?.remainingPercent
+    }
+
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
         provider.status == "ok" && provider.windows.contains {
             ($0.remainingPercent.map { $0 <= 0 } ?? false) || ($0.remainingAmount.map { $0 <= 0 } ?? false)
@@ -1445,6 +1500,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return formatter.localizedString(for: soonest, relativeTo: Date())
     }
 
+    // Relative reset ("in 4h") for a single window's resets_at, e.g. the session
+    // window shown in the collapsed row.
+    private func relativeReset(_ resetsAt: String) -> String? {
+        guard let date = parsedDate(resetsAt), date > Date() else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
     private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
         // Per-provider status when the source is down, rather than repeating the
         // whole connection summary on every row.
@@ -1458,6 +1522,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let account = provider.windows.first(where: { $0.label == "Account credits" }),
            let amount = account.remainingAmount {
             return "\(formattedAmount(amount, currency: account.currency)) available"
+        }
+        // Collapsed row shows the CURRENT-SESSION window's % (not the min across
+        // windows) — and the reset time of that same session window, so the number
+        // and its reset match.
+        if let session = sessionWindow(provider), let pct = session.remainingPercent {
+            let base = pct <= 0 ? "No session quota" : "\(Int(pct.rounded()))% left"
+            if let resetsAt = session.resetsAt, let reset = relativeReset(resetsAt) {
+                return "\(base) · resets \(reset)"
+            }
+            return base
         }
         if let minimum = providerMinimum(provider) {
             let base = minimum <= 0 ? "No quota available" : "\(Int(minimum.rounded()))% left"
@@ -1897,6 +1971,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Replace (or insert) one source, keeping the Hermes-before-Local order.
     private func upsertSource(_ source: SourceQuota) {
+        // Drop a result for a source disabled while its fetch was in flight — it
+        // must not re-add that source's dots after the user turned it off.
+        guard gatewayEnabled(source.kind) else {
+            sources.removeAll { $0.kind == source.kind }
+            return
+        }
         if let index = sources.firstIndex(where: { $0.kind == source.kind }) {
             sources[index] = source
         } else {
@@ -2149,16 +2229,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         guard let lastActive, now - lastActive < hermesSessionFreshWindow else { continue }
                     }
                 }
-                // Colour by the SESSION's provider. The helper (--activity) already
-                // resolves this per session by MODEL family — Claude / Codex /
-                // OpenRouter — and passes it in `billing_provider` (model isn't sent
-                // once resolved). sessionHex maps that to a colour, and still applies
-                // the model-family rules itself if a raw model ever comes through.
-                // One colour PER running session → N sessions, N dots.
-                hexes.append(sessionHex(
-                    billing: session["billing_provider"] as? String,
-                    provider: session["provider"] as? String,
-                    model: session["model"] as? String))
+                // Colour by the SESSION's provider(s). The helper passes `providers`
+                // — the DISTINCT model families the session is running; a
+                // mixture-of-agents session runs several. Join their colours so the
+                // pet draws ONE dot per session, split into a wedge per model. Fall
+                // back to the single resolved provider (billing_provider/model) when
+                // there's just one. One (possibly multi-colour) dot per session.
+                let families = (session["providers"] as? [String])?.filter { !$0.isEmpty } ?? []
+                if !families.isEmpty {
+                    var seen = Set<String>()
+                    var hs: [String] = []
+                    for f in families {
+                        let h = sessionHex(billing: f, provider: nil, model: nil)
+                        if seen.insert(h).inserted { hs.append(h) }
+                    }
+                    hexes.append(hs.joined(separator: ","))
+                } else {
+                    hexes.append(sessionHex(
+                        billing: session["billing_provider"] as? String,
+                        provider: session["provider"] as? String,
+                        model: session["model"] as? String))
+                }
             }
         }
         let busy = statusBusy || !hexes.isEmpty
@@ -2540,7 +2631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         built.append(SourceQuota(kind: kind, providers: self.disconnectedProviders(for: kind), connected: false, generatedAt: nil))
                     }
                 }
-                self.sources = built
+                // Keep only sources still enabled at completion — a source disabled
+                // while this fetch was in flight must not reappear (the toggle-off lag).
+                self.sources = built.filter { self.gatewayEnabled($0.kind) }
                 self.activating.removeAll()   // data landed → clear the spinners
                 self.updateStatusItem()
                 self.rebuildMenu()
