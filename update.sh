@@ -8,8 +8,11 @@ set -euo pipefail
 service_home="$(cd "$(dirname "$0")" && pwd)"
 cd "$service_home"
 
-git fetch --quiet
-# Fast-forward to the tracked upstream (no-op if already current).
-git pull --ff-only
+git fetch --quiet origin
+target="${1:-$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)}"
+if [ -z "$target" ]; then
+    target="origin/main"
+fi
+git merge --ff-only "$target"
 
 bash "$service_home/install-menubar.sh"
