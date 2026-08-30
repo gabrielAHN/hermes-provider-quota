@@ -23,6 +23,8 @@ struct QuotaProvider: Codable {
 }
 
 struct QuotaWindow: Codable {
+    private static let limitReachedRemainingPercent = 5.0
+
     let label: String
     let remainingPercent: Double?
     let remainingAmount: Double?
@@ -30,6 +32,15 @@ struct QuotaWindow: Codable {
     let resetsAt: String?
     let detail: String?
     let warning: Bool
+
+    var limitReached: Bool {
+        Self.reachesLimit(remainingPercent: remainingPercent, remainingAmount: remainingAmount)
+    }
+
+    static func reachesLimit(remainingPercent: Double?, remainingAmount: Double?) -> Bool {
+        (remainingPercent.map { $0 <= limitReachedRemainingPercent } ?? false)
+            || (remainingAmount.map { $0 <= 0 } ?? false)
+    }
 
     enum CodingKeys: String, CodingKey {
         case label
@@ -1149,7 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // row reads consistently; the status dot (red ring) flags any problem.
         image.contentTintColor = providerBrandColor(provider)
         view.addSubview(image)
-        view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold)))
+        view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: providerBrandColor(provider)))
         if let plan = provider.plan {
             view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
         }
@@ -1164,7 +1175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
         // existing bar via the min fallback.
         if connected, provider.status == "ok",
-           let minimum = sessionRemainingPercent(provider) ?? providerMinimum(provider) {
+           let minimum = collapsedRemainingPercent(provider) {
             let track = NSView(frame: NSRect(x: 232, y: 11, width: 104, height: 6))
             track.wantsLayer = true
             track.layer?.cornerRadius = 3
@@ -1311,7 +1322,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Bar colour = the provider's brand colour, turning red only when exhausted.
     private func barColor(for provider: QuotaProvider, remainingPercent: Double?) -> NSColor {
-        if let r = remainingPercent, r <= 0 { return .hermesRed }
+        if QuotaWindow.reachesLimit(remainingPercent: remainingPercent, remainingAmount: nil) {
+            return .hermesRed
+        }
         return providerBrandColor(provider)
     }
 
@@ -1383,10 +1396,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sessionWindow(provider)?.remainingPercent
     }
 
+    private func collapsedRemainingPercent(_ provider: QuotaProvider) -> Double? {
+        provider.windows.filter(\.limitReached).compactMap(\.remainingPercent).min()
+            ?? sessionRemainingPercent(provider)
+            ?? providerMinimum(provider)
+    }
+
     private func providerIsExhausted(_ provider: QuotaProvider) -> Bool {
-        provider.status == "ok" && provider.windows.contains {
-            ($0.remainingPercent.map { $0 <= 0 } ?? false) || ($0.remainingAmount.map { $0 <= 0 } ?? false)
-        }
+        provider.status == "ok" && provider.windows.contains(where: \.limitReached)
     }
 
     private func formattedAmount(_ amount: Double, currency: String?) -> String {
@@ -1516,6 +1533,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
+        let reached = provider.windows.filter(\.limitReached)
+        if !reached.isEmpty {
+            let labels = reached.map(\.label).joined(separator: " + ")
+            return "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
+        }
         // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
         // carry a single "Account credits" window — summarise it as an amount.
         if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)),
@@ -1629,13 +1651,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the quota is low so it stands out.
         let low = window.remainingPercent.map { $0 <= 15 } ?? false
         let bar = hasValue ? barColor(for: provider, remainingPercent: window.remainingPercent) : NSColor.tertiaryLabelColor
-        let valueColor: NSColor = hasValue ? (low ? NSColor.hermesOrange : NSColor.labelColor) : NSColor.tertiaryLabelColor
+        let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : NSColor.labelColor) : NSColor.tertiaryLabelColor
         view.addSubview(label(window.label, frame: NSRect(x: 28, y: 40, width: 170, height: 18), font: .systemFont(ofSize: 12, weight: .medium)))
         let displayValue: String
         if let amount = window.remainingAmount {
             displayValue = "\(formattedAmount(amount, currency: window.currency)) available"
         } else if let percent = window.remainingPercent {
-            displayValue = "\(Int(percent.rounded()))% left"
+            displayValue = window.limitReached ? "Limit reached" : "\(Int(percent.rounded()))% left"
         } else {
             displayValue = "Unavailable"
         }
@@ -1789,6 +1811,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return "/usr/bin/git"
     }
 
+    private static func updateTarget(_ repo: String) -> String? {
+        let remoteHead = run(git(), ["-C", repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        let target = remoteHead.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if remoteHead.code == 0, !target.isEmpty {
+            return target
+        }
+        let main = run(git(), ["-C", repo, "rev-parse", "--verify", "origin/main"])
+        return main.code == 0 ? "origin/main" : nil
+    }
+
     @discardableResult
     private static func run(_ launch: String, _ args: [String], cwd: String? = nil) -> (code: Int32, out: String) {
         let proc = Process()
@@ -1814,13 +1846,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         DispatchQueue.global(qos: .userInitiated).async {
             let git = Self.git()
-            let fetch = Self.run(git, ["-C", repo, "fetch", "--quiet"])
+            let fetch = Self.run(git, ["-C", repo, "fetch", "--quiet", "origin"])
             if fetch.code != 0 {
                 DispatchQueue.main.async { Self.notify("Update check failed", fetch.out.isEmpty ? "git fetch failed" : fetch.out) }
                 return
             }
-            let behind = Int(Self.run(git, ["-C", repo, "rev-list", "--count", "HEAD..@{u}"]).out
-                .trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+            guard let target = Self.updateTarget(repo) else {
+                DispatchQueue.main.async { Self.notify("Update check failed", "The repository default branch could not be found.") }
+                return
+            }
+            let ancestry = Self.run(git, ["-C", repo, "merge-base", "--is-ancestor", "HEAD", target])
+            let behind: Int
+            if ancestry.code == 0 {
+                let revisionList = Self.run(git, ["-C", repo, "rev-list", "--count", "HEAD..\(target)"])
+                guard revisionList.code == 0,
+                      let count = Int(revisionList.out.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                    DispatchQueue.main.async { Self.notify("Update check failed", revisionList.out.isEmpty ? "Could not compare repository versions." : revisionList.out) }
+                    return
+                }
+                behind = count
+            } else if Self.run(git, ["-C", repo, "merge-base", "--is-ancestor", target, "HEAD"]).code == 0 {
+                behind = 0
+            } else {
+                DispatchQueue.main.async { Self.notify("Update unavailable", "The local checkout has changes that are not on \(target). Merge or switch branches before updating.") }
+                return
+            }
             DispatchQueue.main.async {
                 if behind == 0 {
                     Self.notify("Up to date", "You're on the latest version.")
@@ -1835,7 +1885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if alert.runModal() == .alertFirstButtonReturn {
                     // Detached: install-menubar.sh boots this app out and back in, so
                     // it must not be a child of this process.
-                    Self.run("/bin/sh", ["-c", "nohup bash \(Self.shellQuote(repo))/update.sh >/tmp/provider-quotas-update.log 2>&1 &"])
+                    Self.run("/bin/sh", ["-c", "nohup bash \(Self.shellQuote(repo))/update.sh \(Self.shellQuote(target)) >/tmp/provider-quotas-update.log 2>&1 &"])
                     Self.notify("Updating…", "Pulling the latest and reinstalling — the menu-bar app will relaunch shortly.")
                 }
             }
