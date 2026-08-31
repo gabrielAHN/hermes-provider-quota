@@ -8,6 +8,15 @@ plist_target="$HOME/Library/LaunchAgents/io.github.gabrielahn.provider-quotas.pl
 launch_target="gui/$(id -u)"
 label="io.github.gabrielahn.provider-quotas"
 
+# Preflight: the app is built with the Swift compiler from Xcode's command-line
+# tools. Fail early with the one-line fix instead of a cryptic xcrun error.
+if ! xcrun --find swiftc >/dev/null 2>&1; then
+    echo "→ Xcode command-line tools are required (for swiftc)." >&2
+    echo "  Accept the macOS install prompt that opens, then re-run: bash install-menubar.sh" >&2
+    xcode-select --install >/dev/null 2>&1 || true
+    exit 1
+fi
+
 # Record where we installed from so the app's "Check for Updates" can `git pull`
 # this checkout and rebuild (update.sh). No-op for non-git installs.
 defaults write "$label" sourceRepo "$service_home" 2>/dev/null || true
@@ -79,3 +88,16 @@ if launchctl print "$launch_target/$label" >/dev/null 2>&1; then
     done
 fi
 launchctl bootstrap "$launch_target" "$plist_target"
+
+# Confirm it came up, and point at the menu bar so the install ends with a clear
+# "what now".
+for _ in $(seq 1 20); do
+    pgrep -f "$binary_target" >/dev/null 2>&1 && break
+    sleep 0.25
+done
+if pgrep -f "$binary_target" >/dev/null 2>&1; then
+    echo "✓ Provider Quotas is running — its icon is in the menu bar (top-right)."
+    echo "  Click it, then turn on Hermes and/or Local under \"Sources\"."
+else
+    echo "⚠ It didn't start — check ~/.hermes/logs/provider-quotas-error.log" >&2
+fi

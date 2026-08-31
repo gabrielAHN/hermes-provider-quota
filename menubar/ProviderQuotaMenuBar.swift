@@ -704,10 +704,10 @@ final class ActivityPetsView: NSView {
             // so a short row (e.g. the duck's 4-frame idle) loops cleanly instead
             // of stepping into blank cells. Fall back to 6 if we couldn't measure.
             let rowFrameCount = max(rowFrames.indices.contains(row) ? rowFrames[row] : 6, 1)
-            // Advance one frame every 2 redraw ticks — a calm ~5 fps where every
+            // Advance one frame every 2 redraw ticks — a steady ~5 fps where every
             // frame is held for exactly the same time, so the walk/idle cycle reads
-            // as steady, not staggered or rushed. (1680 is a multiple of every
-            // frame count, so the loop stays even across the phase wrap.)
+            // as lively but even, not staggered or rushed. (1680/2 = 840 is a
+            // multiple of every frame count, so the loop stays even across the wrap.)
             let frame = (phase / 2) % rowFrameCount
             let source = NSRect(
                 x: CGFloat(frame) * frameWidth,
@@ -774,25 +774,45 @@ final class ActivityPetsView: NSView {
             for (gi, group) in groups.enumerated() {
                 let gw = groupW(group.colors.count)
                 // A rounded background border around THIS session's dots, so the
-                // model(s) it runs read as one bounded group.
-                let pad: CGFloat = 2.5
-                let cap = NSRect(x: x - pad, y: cy - 6.5, width: gw + pad * 2, height: 13)
-                let capPath = NSBezierPath(roundedRect: cap, xRadius: 6.5, yRadius: 6.5)
+                // model(s) it runs read as one bounded group. A HEIGHT-based corner
+                // radius gives fully-round ends — a perfect circle for a single-model
+                // session (padX makes its width == the height), a horizontal pill for
+                // several — instead of the squished vertical oval a fixed 6.5 radius
+                // on an 11×13 box produced.
+                let padX: CGFloat = 3
+                let capH: CGFloat = 12
+                let cap = NSRect(x: x - padX, y: cy - capH / 2, width: gw + padX * 2, height: capH)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: capH / 2, yRadius: capH / 2)
                 NSColor.black.withAlphaComponent(0.4).setFill()
                 capPath.fill()
                 NSColor.white.withAlphaComponent(0.35).setStroke()
                 capPath.lineWidth = 0.75
                 capPath.stroke()
 
-                let alpha: CGFloat = group.busy ? 1 : 0.55
-                let highlight = group.busy && gi == phase % max(groups.count, 1)
-                let pulse: CGFloat = group.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(gi)) + 1) * 0.5) : 0
-                let size = dotSize + (highlight ? 1.0 : 0) + pulse
-                for color in group.colors {
+                // "Running" is shown by a GLOWING BORDER that ENLARGES on a ~1s beat
+                // — the dot's colour and size never change, so it always reads as its
+                // provider; only the pulsing glow ring around it says "working".
+                for (ci, color) in group.colors.enumerated() {
                     let cx = x + dotSize / 2
-                    let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
-                    color.withAlphaComponent(alpha).setFill()
-                    dot.fill()
+                    let dotRect = NSRect(x: cx - dotSize / 2, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    if group.busy {
+                        let g = CGFloat((sin(Double(phase) * .pi / 5 + Double(gi) + Double(ci) * 0.6) + 1) * 0.5)
+                        let r = dotSize / 2 + 0.75 + 2.0 * g          // the border enlarges with the beat
+                        let ring = NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+                        NSGraphicsContext.saveGraphicsState()
+                        let shadow = NSShadow()
+                        shadow.shadowColor = color.withAlphaComponent(0.9)   // glow in the dot's own colour
+                        shadow.shadowBlurRadius = 1.5 + 3.0 * g
+                        shadow.shadowOffset = .zero
+                        shadow.set()
+                        color.withAlphaComponent(0.4 + 0.5 * g).setStroke()
+                        ring.lineWidth = 1.3
+                        ring.stroke()
+                        NSGraphicsContext.restoreGraphicsState()
+                    }
+                    color.setFill()                                   // constant, solid provider colour
+                    NSBezierPath(ovalIn: dotRect).fill()
+                    let dot = NSBezierPath(ovalIn: dotRect)
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
@@ -1006,6 +1026,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Provider colour (hex) per ACTIVE Hermes session, so its dots match the real
     // provider (e.g. OpenRouter purple) instead of a generic gateway colour.
     private var hermesSessionHexes: [String] = []
+    // Last local session scan, cached so an eye toggle can rebuild the pet
+    // synchronously (immediately) without waiting for the next 1s scan.
+    private var lastLocalSessions: [LocalSession] = []
     private var hermesActivityTimer: Timer?
     private var hermesPollInFlight = false
 
@@ -1146,8 +1169,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // provider's SOURCE state (so a provider from a down source reads red even if
     // the other source is up).
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
         let key = providerKey(kind, provider.provider)
+
+        // Hidden via the eye → a minimal row: just the provider NAME + the eye
+        // (dimmed). It stays in the menu so you can re-enable it, but drops all of
+        // its quota info, and isn't expandable.
+        if !providerShownInMenuBar(kind, provider.provider) {
+            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
+            row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
+                                 font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
+            let eyeOff = NSButton(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            eyeOff.isBordered = false
+            eyeOff.title = ""
+            eyeOff.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click to show")
+            eyeOff.imagePosition = .imageOnly
+            eyeOff.imageScaling = .scaleProportionallyDown
+            eyeOff.contentTintColor = .tertiaryLabelColor
+            eyeOff.identifier = NSUserInterfaceItemIdentifier(key)
+            eyeOff.target = self
+            eyeOff.action = #selector(toggleProviderMenuBar(_:))
+            eyeOff.toolTip = "Show \(provider.label) again"
+            row.addSubview(eyeOff)
+            return row
+        }
+
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
         let expanded = expandedProviders.contains(key)
         let chevron = NSImageView(frame: NSRect(x: 13, y: 18, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
@@ -1536,7 +1582,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
             let labels = reached.map(\.label).joined(separator: " + ")
-            return "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
+            let base = "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
+            // Show WHEN it frees up — the soonest reset among the reached windows.
+            if let soonest = reached.compactMap({ parsedDate($0.resetsAt) }).filter({ $0 > Date() }).min() {
+                let formatter = RelativeDateTimeFormatter()
+                formatter.unitsStyle = .short
+                return "\(base) · resets \(formatter.localizedString(for: soonest, relativeTo: Date()))"
+            }
+            return base
         }
         // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
         // carry a single "Account credits" window — summarise it as an amount.
@@ -2167,6 +2220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let local = Self.fetchLocalActivity()
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.lastLocalSessions = local
                 self.activityPanel.show(self.buildSourcePetTiles(localSessions: local))
             }
         }
@@ -2196,6 +2250,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
+            // Providers the user hid via the eye toggle shouldn't show a pet dot
+            // either — drop any dot whose colour belongs to a hidden provider, and
+            // drop a whole session mark when every one of its models is hidden.
+            let hiddenColors = Set((sources.first { $0.kind == kind }?.providers ?? [])
+                .filter { !providerShownInMenuBar(kind, $0.provider) }
+                .map { Self.providerHex($0.provider).lowercased() })
+            func visibleMark(_ hex: String) -> SessionMark? {
+                guard !hiddenColors.isEmpty else { return SessionMark(hex: hex, busy: true) }
+                let kept = hex.split(separator: ",").map(String.init)
+                    .filter { !hiddenColors.contains($0.lowercased()) }
+                return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: true)
+            }
+
             let marks: [SessionMark]
             let title: String
             let working: Bool
@@ -2203,13 +2270,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Dots map ONLY to real running sessions (is_active). Merely being
                 // connected — or the Desktop being active while you sign in — makes
                 // the pet WORK (hermesBusy) but shows NO dots.
-                marks = hermesSessionHexes.map { SessionMark(hex: $0, busy: true) }
+                marks = hermesSessionHexes.compactMap(visibleMark)
                 title = marks.isEmpty ? "" : "\(marks.count) agent\(marks.count == 1 ? "" : "s") running"
                 working = hermesBusy || !marks.isEmpty
             } else {
                 let busy = localSessions.filter { $0.busy }   // idle/open sessions show nothing
-                marks = busy.map { SessionMark(hex: $0.hex, busy: true) }
-                title = "\(busy.count) session\(busy.count == 1 ? "" : "s")"
+                marks = busy.compactMap { visibleMark($0.hex) }
+                title = "\(marks.count) session\(marks.count == 1 ? "" : "s")"
                 working = !marks.isEmpty
             }
 
@@ -2907,6 +2974,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setProviderShownInMenuBar(kind, parts[1], !providerShownInMenuBar(kind, parts[1]))
         updateStatusItem()
         rebuildMenu()
+        // Reflect the change in the pet IMMEDIATELY — rebuild from the cached
+        // sessions (Hermes hexes + last local scan) with the new hidden filter, so
+        // a hidden provider's dots vanish on click, not on the next 1s poll.
+        activityPanel.show(buildSourcePetTiles(localSessions: lastLocalSessions))
     }
 
     @objc private func openGateway() {
