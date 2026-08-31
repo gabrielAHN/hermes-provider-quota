@@ -774,10 +774,15 @@ final class ActivityPetsView: NSView {
             for (gi, group) in groups.enumerated() {
                 let gw = groupW(group.colors.count)
                 // A rounded background border around THIS session's dots, so the
-                // model(s) it runs read as one bounded group.
-                let pad: CGFloat = 2.5
-                let cap = NSRect(x: x - pad, y: cy - 6.5, width: gw + pad * 2, height: 13)
-                let capPath = NSBezierPath(roundedRect: cap, xRadius: 6.5, yRadius: 6.5)
+                // model(s) it runs read as one bounded group. A HEIGHT-based corner
+                // radius gives fully-round ends — a perfect circle for a single-model
+                // session (padX makes its width == the height), a horizontal pill for
+                // several — instead of the squished vertical oval a fixed 6.5 radius
+                // on an 11×13 box produced.
+                let padX: CGFloat = 3
+                let capH: CGFloat = 12
+                let cap = NSRect(x: x - padX, y: cy - capH / 2, width: gw + padX * 2, height: capH)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: capH / 2, yRadius: capH / 2)
                 NSColor.black.withAlphaComponent(0.4).setFill()
                 capPath.fill()
                 NSColor.white.withAlphaComponent(0.35).setStroke()
