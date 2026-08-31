@@ -1187,25 +1187,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
-        // Hidden via the eye → a minimal row: just the provider NAME + the eye
-        // (dimmed). It stays in the menu so you can re-enable it, but drops all of
-        // its quota info, and isn't expandable.
+        // Hidden via the eye → a minimal row: just the provider NAME + a dimmed
+        // eye.slash. It drops all quota info and isn't expandable — and the WHOLE
+        // row is clickable to reveal the provider again (not only the eye).
         if !providerShownInMenuBar(kind, provider.provider) {
             let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
             row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
                                  font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
-            let eyeOff = NSButton(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
-            eyeOff.isBordered = false
-            eyeOff.title = ""
-            eyeOff.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click to show")
-            eyeOff.imagePosition = .imageOnly
-            eyeOff.imageScaling = .scaleProportionallyDown
-            eyeOff.contentTintColor = .tertiaryLabelColor
-            eyeOff.identifier = NSUserInterfaceItemIdentifier(key)
-            eyeOff.target = self
-            eyeOff.action = #selector(toggleProviderMenuBar(_:))
-            eyeOff.toolTip = "Show \(provider.label) again"
-            row.addSubview(eyeOff)
+            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            eyeIcon.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click the row to show")
+            eyeIcon.imageScaling = .scaleProportionallyDown
+            eyeIcon.contentTintColor = .tertiaryLabelColor
+            row.addSubview(eyeIcon)
+            // Whole-row reveal button on top: click anywhere to show the provider.
+            let reveal = NSButton(frame: row.bounds)
+            reveal.isBordered = false
+            reveal.title = ""
+            reveal.identifier = NSUserInterfaceItemIdentifier(key)
+            reveal.target = self
+            reveal.action = #selector(toggleProviderMenuBar(_:))
+            reveal.toolTip = "Show \(provider.label) again"
+            row.addSubview(reveal)
             return row
         }
 
