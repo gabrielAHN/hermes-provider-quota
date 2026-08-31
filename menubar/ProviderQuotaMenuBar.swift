@@ -704,11 +704,11 @@ final class ActivityPetsView: NSView {
             // so a short row (e.g. the duck's 4-frame idle) loops cleanly instead
             // of stepping into blank cells. Fall back to 6 if we couldn't measure.
             let rowFrameCount = max(rowFrames.indices.contains(row) ? rowFrames[row] : 6, 1)
-            // Advance one frame every 3 redraw ticks — a calm ~3.3 fps where every
+            // Advance one frame every 2 redraw ticks — a steady ~5 fps where every
             // frame is held for exactly the same time, so the walk/idle cycle reads
-            // as slow and steady, not staggered or rushed. (1680/3 = 560 is still a
+            // as lively but even, not staggered or rushed. (1680/2 = 840 is a
             // multiple of every frame count, so the loop stays even across the wrap.)
-            let frame = (phase / 3) % rowFrameCount
+            let frame = (phase / 2) % rowFrameCount
             let source = NSRect(
                 x: CGFloat(frame) * frameWidth,
                 y: image.size.height - CGFloat(row + 1) * frameHeight,
@@ -789,19 +789,19 @@ final class ActivityPetsView: NSView {
                 capPath.lineWidth = 0.75
                 capPath.stroke()
 
-                // A soft highlight that GLIDES across the session's dots instead of
-                // snapping — one point roughly every 1.6s — with a smooth swell in
-                // size + opacity around the moving crest, so the emphasis transitions
-                // gently from one point to the next. A slow per-dot "breathe" keeps a
-                // lone dot alive when there's nothing for the crest to travel across.
+                // Make "running" obvious: a busy dot PULSES on a clear ~1s beat
+                // (size + brightness swing) so activity reads at a glance, plus a
+                // faster travelling crest (~0.8s/point) that glides the emphasis
+                // smoothly across a session's dots. An idle dot sits dim and static,
+                // so busy vs idle is unmistakable.
                 let n = Double(max(groups.count, 1))
-                let crest = Double(phase) / 16.0                       // one group per 16 ticks (~1.6s)
+                let crest = Double(phase) / 8.0                        // one point per 8 ticks (~0.8s)
                 var d = (crest - Double(gi)).truncatingRemainder(dividingBy: n)
                 if d < 0 { d += n }
-                let emphasis = max(0.0, 1.0 - min(d, n - d))           // smooth 1→0 falloff around the crest
-                let breathe = (sin(Double(phase) * .pi / 12 + Double(gi)) + 1) * 0.5   // slow ~2.4s, per-dot offset
-                let alpha: CGFloat = group.busy ? CGFloat(0.55 + 0.45 * emphasis) : 0.5
-                let pulse: CGFloat = group.busy ? CGFloat(0.7 * emphasis + 0.5 * breathe) : 0
+                let emphasis = max(0.0, 1.0 - min(d, n - d))           // 1 at the crest → 0 away
+                let beat = (sin(Double(phase) * .pi / 5) + 1) * 0.5    // clear ~1s rhythmic pulse
+                let alpha: CGFloat = group.busy ? CGFloat(0.5 + 0.5 * max(Double(emphasis), beat)) : 0.4
+                let pulse: CGFloat = group.busy ? CGFloat(1.8 * beat + 1.0 * emphasis) : 0
                 let size = dotSize + pulse
                 for color in group.colors {
                     let cx = x + dotSize / 2
@@ -1161,8 +1161,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // provider's SOURCE state (so a provider from a down source reads red even if
     // the other source is up).
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
         let key = providerKey(kind, provider.provider)
+
+        // Hidden via the eye → a minimal row: just the provider NAME + the eye
+        // (dimmed). It stays in the menu so you can re-enable it, but drops all of
+        // its quota info, and isn't expandable.
+        if !providerShownInMenuBar(kind, provider.provider) {
+            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
+            row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
+                                 font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
+            let eyeOff = NSButton(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            eyeOff.isBordered = false
+            eyeOff.title = ""
+            eyeOff.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click to show")
+            eyeOff.imagePosition = .imageOnly
+            eyeOff.imageScaling = .scaleProportionallyDown
+            eyeOff.contentTintColor = .tertiaryLabelColor
+            eyeOff.identifier = NSUserInterfaceItemIdentifier(key)
+            eyeOff.target = self
+            eyeOff.action = #selector(toggleProviderMenuBar(_:))
+            eyeOff.toolTip = "Show \(provider.label) again"
+            row.addSubview(eyeOff)
+            return row
+        }
+
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 48))
         let expanded = expandedProviders.contains(key)
         let chevron = NSImageView(frame: NSRect(x: 13, y: 18, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
@@ -1551,7 +1574,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
             let labels = reached.map(\.label).joined(separator: " + ")
-            return "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
+            let base = "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
+            // Show WHEN it frees up — the soonest reset among the reached windows.
+            if let soonest = reached.compactMap({ parsedDate($0.resetsAt) }).filter({ $0 > Date() }).min() {
+                let formatter = RelativeDateTimeFormatter()
+                formatter.unitsStyle = .short
+                return "\(base) · resets \(formatter.localizedString(for: soonest, relativeTo: Date()))"
+            }
+            return base
         }
         // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
         // carry a single "Account credits" window — summarise it as an amount.
