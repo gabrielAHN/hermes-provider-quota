@@ -1201,36 +1201,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         activeSessionColors(kind).contains(Self.providerHex(slug).lowercased())
     }
 
-    // A status dot with a bold, clearly-COLOURED glow baked into the image, for an
-    // actively-running provider in the menu. Drawn (not a layer shadow) so it always
-    // renders inside the NSMenu, and a soft colour wash makes the provider's own
-    // colour apparent.
-    private func glowingDotImage(_ provider: QuotaProvider, connected: Bool, canvas: CGFloat) -> NSImage {
-        let dot: CGFloat = 14
-        let base = providerDotImage(provider, size: dot, connected: connected)
-        let rect = NSRect(x: (canvas - dot) / 2, y: (canvas - dot) / 2, width: dot, height: dot)
-        let color = providerBrandColor(provider)
-        let img = NSImage(size: NSSize(width: canvas, height: canvas))
-        img.lockFocus()
-        // Soft colour wash halo behind, so the glow reads clearly IN the provider's colour.
-        color.withAlphaComponent(0.30).setFill()
-        NSBezierPath(ovalIn: rect.insetBy(dx: -6, dy: -6)).fill()
-        // Bold shadow-glow, drawn twice to strengthen it.
-        for _ in 0..<2 {
-            NSGraphicsContext.current?.saveGraphicsState()
-            let shadow = NSShadow()
-            shadow.shadowColor = color.withAlphaComponent(0.95)
-            shadow.shadowBlurRadius = 6
-            shadow.shadowOffset = .zero
-            shadow.set()
-            base.draw(in: rect)
-            NSGraphicsContext.current?.restoreGraphicsState()
-        }
-        base.draw(in: rect)   // crisp dot on top
-        img.unlockFocus()
-        return img
-    }
-
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
@@ -1275,20 +1245,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let plan = provider.plan {
             view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
         }
-        // Status dot — and if this provider has a session running RIGHT NOW (its
-        // colour is live in the pet, INCLUDING as one model of a multi-model
-        // session), draw it with a bold coloured glow BAKED INTO the image so it
-        // renders reliably in the menu (a layer shadow doesn't, inside an NSMenu).
-        if providerActive(kind, provider.provider) {
-            let canvas: CGFloat = 34
-            let glowView = NSImageView(frame: NSRect(x: 329 - canvas / 2, y: 34 - canvas / 2, width: canvas, height: canvas))
-            glowView.image = glowingDotImage(provider, connected: connected, canvas: canvas)
-            view.addSubview(glowView)
-        } else {
-            let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
-            statusImage.image = providerDotImage(provider, size: 14, connected: connected)
-            view.addSubview(statusImage)
-        }
+        let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
+        statusImage.image = providerDotImage(provider, size: 14, connected: connected)
+        view.addSubview(statusImage)
         // Brief line: summary text + an overall provider-coloured bar. Same font
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
@@ -1593,10 +1552,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Draws a provider status dot into the current context: the dot in the
     // provider's own colour, and — when it's OFFLINE or OUT OF QUOTA — a bold red
     // ring drawn OUTSIDE it (with a clear gap) so the alert reads at a glance.
-    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool) {
+    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool, active: Bool = false) {
         let s = rect.width
         let fillInset = bad ? s * 0.26 : s * 0.12
-        let fill = NSBezierPath(ovalIn: rect.insetBy(dx: fillInset, dy: fillInset))
+        let dotRect = rect.insetBy(dx: fillInset, dy: fillInset)
+        // A provider running a session RIGHT NOW glows its menu-bar dot in its own
+        // colour (matches the pet's session glow).
+        if active {
+            // Soft colour wash so the glow reads clearly IN the provider's colour.
+            color.withAlphaComponent(0.22).setFill()
+            NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5, dy: -2.5)).fill()
+            NSGraphicsContext.current?.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = color.withAlphaComponent(0.95)
+            shadow.shadowBlurRadius = 3
+            shadow.shadowOffset = .zero
+            shadow.set()
+            color.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            NSBezierPath(ovalIn: dotRect).fill()   // second pass strengthens the glow
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
+        let fill = NSBezierPath(ovalIn: dotRect)
         color.setFill()
         fill.fill()
         if bad {
@@ -1705,18 +1682,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // source contributes only the providers you haven't hidden with the eye.
         let step: CGFloat = 15      // per-dot advance
         let sectionGap: CGFloat = 9 // extra space between source sections
-        let sections: [(connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
+        let height: CGFloat = 18    // taller than the 11px dot so an active dot's glow fits
+        let dotY: CGFloat = 3.5
+        let lead: CGFloat = 4       // horizontal padding so an edge dot's glow isn't clipped
+        let sections: [(kind: GatewayKind, connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
             let visible = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
-            return visible.isEmpty ? nil : (source.connected, visible)
+            return visible.isEmpty ? nil : (source.kind, source.connected, visible)
         }
         let dotCount = sections.reduce(0) { $0 + $1.providers.count }
 
         if dotCount == 0 {
-            let image = NSImage(size: NSSize(width: 15, height: 15))
+            let image = NSImage(size: NSSize(width: 15, height: height))
             image.lockFocus()
             let color = anyConnected ? NSColor.tertiaryLabelColor : NSColor.hermesRed
             color.setStroke()
-            let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 11, height: 11))
+            let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: dotY, width: 11, height: 11))
             dot.lineWidth = 2
             dot.stroke()
             image.unlockFocus()
@@ -1724,15 +1704,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return image
         }
 
-        let width = CGFloat(dotCount) * step + CGFloat(max(0, sections.count - 1)) * sectionGap + 2
-        let image = NSImage(size: NSSize(width: width, height: 15))
+        let width = CGFloat(dotCount) * step + CGFloat(max(0, sections.count - 1)) * sectionGap + lead * 2
+        let image = NSImage(size: NSSize(width: width, height: height))
         image.lockFocus()
-        var x: CGFloat = 2
+        var x: CGFloat = lead
         for (index, section) in sections.enumerated() {
             for provider in section.providers {
-                drawProviderDot(in: NSRect(x: x, y: 2, width: 11, height: 11),
+                drawProviderDot(in: NSRect(x: x, y: dotY, width: 11, height: 11),
                                 color: providerBrandColor(provider.provider),
-                                bad: providerAlarming(provider, connected: section.connected))
+                                bad: providerAlarming(provider, connected: section.connected),
+                                active: providerActive(section.kind, provider.provider))
                 x += step
             }
             if index < sections.count - 1 { x += sectionGap }
@@ -2320,7 +2301,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.lastLocalSessions = local
                 self.activityPanel.show(self.buildSourcePetTiles(localSessions: local))
+                self.refreshStatusDotsIfActiveChanged()
             }
+        }
+    }
+
+    // Redraw the menu-bar dots only when the set of actively-running providers
+    // changes, so their session glow stays live (~1s) without a needless redraw
+    // every tick.
+    private var lastActiveSignature = ""
+    private func refreshStatusDotsIfActiveChanged() {
+        let sig = activeSessionColors(.hermes).union(activeSessionColors(.local)).sorted().joined(separator: ",")
+        if sig != lastActiveSignature {
+            lastActiveSignature = sig
+            updateStatusItem()
         }
     }
 
