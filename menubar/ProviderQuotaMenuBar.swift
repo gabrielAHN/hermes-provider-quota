@@ -789,42 +789,34 @@ final class ActivityPetsView: NSView {
                 // coherent glow. The capsule is a circle for a single model, a
                 // horizontal pill for several; the dots inside keep constant colours.
                 let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
-                let grow = 1.0 * g           // a gentle enlarge that stays within the tile (no clipping)
-                let cap = NSRect(x: cx0 - grow, y: cy - capH / 2 - grow,
-                                 width: w + grow * 2, height: capH + grow * 2)
+                // Subtle dark backing pill groups a session's dots — no glow / no border
+                // on the pill itself; the GLOW is on each POINT (below), in the point's
+                // OWN provider colour, matching the menu-bar dots.
+                let cap = NSRect(x: cx0, y: cy - capH / 2, width: w, height: capH)
                 let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
-                if group.busy {
-                    // A pure GLOW — no border line: the dark pill casts a soft coloured
-                    // shadow in the session's blended colour (its own colour for one
-                    // model) that pulses + enlarges on the beat, so the group reads as
-                    // one glowing running unit.
-                    let glowColor: NSColor = {
-                        let rgb = group.colors.compactMap { $0.usingColorSpace(.sRGB) }
-                        guard let first = rgb.first else { return .white }
-                        if rgb.count == 1 { return first }
-                        let n = CGFloat(rgb.count)
-                        return NSColor(srgbRed: rgb.map { $0.redComponent }.reduce(0, +) / n,
-                                       green: rgb.map { $0.greenComponent }.reduce(0, +) / n,
-                                       blue: rgb.map { $0.blueComponent }.reduce(0, +) / n, alpha: 1)
-                    }()
-                    NSGraphicsContext.saveGraphicsState()
-                    let shadow = NSShadow()
-                    shadow.shadowColor = glowColor.withAlphaComponent(0.95)
-                    shadow.shadowBlurRadius = 1.0 + 2.5 * g
-                    shadow.shadowOffset = .zero
-                    shadow.set()
-                    NSColor.black.withAlphaComponent(0.5).setFill()   // dark backing casts the glow
-                    capPath.fill()
-                    NSGraphicsContext.restoreGraphicsState()
-                } else {
-                    NSColor.black.withAlphaComponent(0.3).setFill()
-                    capPath.fill()
-                }
+                NSColor.black.withAlphaComponent(group.busy ? 0.42 : 0.3).setFill()
+                capPath.fill()
 
-                // Dots on top — crisp, constant provider colour, fixed size.
+                // Each point glows in ITS OWN colour: a soft colour wash + a shadow-glow
+                // that pulses + enlarges on the beat — one glowing dot for a single model,
+                // two adjacent glowing dots (each its colour) for a multi-model session.
                 var dx = cx0 + padX
                 for color in group.colors {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    if group.busy {
+                        color.withAlphaComponent(0.22).setFill()
+                        NSBezierPath(ovalIn: dotRect.insetBy(dx: -1.5 - g, dy: -1.5 - g)).fill()
+                        NSGraphicsContext.saveGraphicsState()
+                        let shadow = NSShadow()
+                        shadow.shadowColor = color.withAlphaComponent(0.95)
+                        shadow.shadowBlurRadius = 1.5 + 2.0 * g
+                        shadow.shadowOffset = .zero
+                        shadow.set()
+                        color.setFill()
+                        NSBezierPath(ovalIn: dotRect).fill()
+                        NSBezierPath(ovalIn: dotRect).fill()
+                        NSGraphicsContext.restoreGraphicsState()
+                    }
                     color.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
                     let dot = NSBezierPath(ovalIn: dotRect)
