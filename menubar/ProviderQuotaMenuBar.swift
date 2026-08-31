@@ -1910,9 +1910,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Check the repo this app was installed from for newer commits; if behind,
     // offer to pull the latest and reinstall (rebuilds + relaunches the app). The
     // update runs DETACHED so it survives the app being booted out mid-reinstall.
+    // A Homebrew install has no git checkout — its update path is `brew upgrade`.
+    private func homebrewInstalled() -> Bool {
+        Bundle.main.bundlePath.contains("/Cellar/provider-quotas/")
+    }
+
+    private func brewExecutable() -> String? {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
     @objc private func checkForUpdates() {
         guard let repo = sourceRepoPath() else {
-            Self.notify("Update unavailable", "Reinstall from a git clone of the repo (run install-menubar.sh) to enable in-app updates.")
+            // Homebrew install → `brew upgrade` (then restart the service).
+            if homebrewInstalled(), let brew = brewExecutable() {
+                Self.notify("Updating…", "brew upgrade provider-quotas")
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let up = Self.run(brew, ["upgrade", "provider-quotas"])
+                    if up.code == 0 { _ = Self.run(brew, ["services", "restart", "provider-quotas"]) }
+                    DispatchQueue.main.async {
+                        Self.notify(up.code == 0 ? "Updated" : "Update finished",
+                                    up.out.isEmpty ? "brew upgrade provider-quotas" : String(up.out.suffix(300)))
+                    }
+                }
+                return
+            }
+            Self.notify("Update unavailable", "Reinstall from a git clone (install-menubar.sh), or `brew upgrade provider-quotas`.")
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -2162,7 +2184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func syncPetsFromGateway() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let fm = FileManager.default
-            let helper = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+            let helper = Self.helperPath("hermes-desktop-quotas")
             guard fm.isExecutableFile(atPath: helper) else { return }
             guard let listData = Self.runHelper(helper, ["/api/plugins/provider-quota/pets"]),
                   let obj = try? JSONSerialization.jsonObject(with: listData) as? [String: Any],
@@ -2316,8 +2338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // `billing_provider` — so OpenRouter shows purple, Codex green, etc. Works for
     // a REMOTE gateway, where sessions run server-side.
     private static func fetchGatewayActivity() -> (busy: Bool, agents: Int, sessionHexes: [String]) {
-        let helper = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+        let helper = helperPath("hermes-desktop-quotas")
         guard FileManager.default.isExecutableFile(atPath: helper) else {
             return (false, 0, [])
         }
@@ -2792,12 +2813,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
+    // Locate a helper across the places the installers put it: ~/.local/bin
+    // (install-menubar.sh) and Homebrew's bin (brew install). First existing +
+    // executable wins; falls back to ~/.local/bin.
+    static func helperPath(_ name: String) -> String {
+        let fm = FileManager.default
+        let fallback = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/\(name)").path
+        var candidates = [fallback, "/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            candidates += path.split(separator: ":").map { "\($0)/\(name)" }
+        }
+        return candidates.first { fm.isExecutableFile(atPath: $0) } ?? fallback
+    }
+
     private static func runHelper(_ name: String) -> Result<QuotaPayload, Error> {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
-        let helper = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/\(name)").path
+        let helper = helperPath(name)
         guard FileManager.default.isExecutableFile(atPath: helper) else {
             return .failure(NSError(domain: "ProviderQuotaMenuBar", code: 127, userInfo: [NSLocalizedDescriptionKey: "\(name) is not installed"]))
         }

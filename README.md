@@ -58,6 +58,24 @@ pet shows a "not working" state (red halo + `!`).
 
 ## Install
 
+### Homebrew (easiest)
+
+```bash
+brew tap gabrielahn/quota https://github.com/gabrielAHN/quota-viewer-ios
+brew install --HEAD gabrielahn/quota/provider-quotas   # builds from source
+brew services start provider-quotas                    # menu bar + run at login
+```
+
+Update anytime with `brew upgrade provider-quotas` (or the app's **Check for
+Updates**, which runs `brew upgrade` for you). The formula installs the app and
+the `hermes-{desktop,local}-quotas` helpers, and fetches the curated pets. On a
+Hermes **gateway** host, also run `./install.sh` (below) to install the plugin.
+
+_(Until a version is tagged, use `--HEAD` to build from `main`; once released,
+`brew install gabrielahn/quota/provider-quotas` installs the stable build.)_
+
+### From a git clone
+
 On the machine running your Hermes gateway:
 
 ```bash
