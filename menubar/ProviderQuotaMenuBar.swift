@@ -756,7 +756,7 @@ final class ActivityPetsView: NSView {
             let dotSize: CGFloat = 6
             let innerGap: CGFloat = 1.5   // between models within a session
             let groupGap: CGFloat = 9     // between session capsules
-            let cy = tileRect.minY + 7
+            let cy = tileRect.minY + 9    // a little clear of the bottom edge so the glow isn't clipped
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
             for mark in tile.sessions {
@@ -773,8 +773,8 @@ final class ActivityPetsView: NSView {
             var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
             for (gi, group) in groups.enumerated() {
                 let gw = groupW(group.colors.count)
-                let padX: CGFloat = 3
-                let capH: CGFloat = 12
+                let padX: CGFloat = 2         // one-dot capsule stays a tight circle (width == height)
+                let capH: CGFloat = 10        // hug the dots so the glow sits close, not far out
                 // "Running" glows the WHOLE session capsule in sync and ENLARGES it on
                 // a ~1s beat, so a multi-model session's adjacent dots share ONE
                 // coherent glow instead of per-dot rings that collide when the points
@@ -782,7 +782,7 @@ final class ActivityPetsView: NSView {
                 // (padX makes width == height), a horizontal pill for several. The
                 // dots inside keep their constant provider colours.
                 let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
-                let grow = 2.0 * g
+                let grow = 1.0 * g           // a gentle enlarge that stays within the tile (no clipping)
                 let cap = NSRect(x: x - padX - grow, y: cy - capH / 2 - grow,
                                  width: gw + padX * 2 + grow * 2, height: capH + grow * 2)
                 let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
@@ -802,12 +802,12 @@ final class ActivityPetsView: NSView {
                     }()
                     NSGraphicsContext.saveGraphicsState()
                     let shadow = NSShadow()
-                    shadow.shadowColor = glowColor.withAlphaComponent(0.9)
-                    shadow.shadowBlurRadius = 2.0 + 4.0 * g
+                    shadow.shadowColor = glowColor.withAlphaComponent(0.95)
+                    shadow.shadowBlurRadius = 0.5 + 2.0 * g   // tighter glow, hugging the dots
                     shadow.shadowOffset = .zero
                     shadow.set()
-                    glowColor.withAlphaComponent(0.5 + 0.4 * g).setStroke()
-                    capPath.lineWidth = 1.4
+                    glowColor.withAlphaComponent(0.55 + 0.4 * g).setStroke()
+                    capPath.lineWidth = 1.3
                     capPath.stroke()
                     NSGraphicsContext.restoreGraphicsState()
                 } else {
