@@ -755,7 +755,8 @@ final class ActivityPetsView: NSView {
             // session's dots. Total dots capped so the row fits under the pet.
             let dotSize: CGFloat = 6
             let innerGap: CGFloat = 1.5   // between models within a session
-            let groupGap: CGFloat = 9     // between session capsules
+            let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
+            let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
             let cy = tileRect.minY + 9    // a little clear of the bottom edge so the glow isn't clipped
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
@@ -768,23 +769,29 @@ final class ActivityPetsView: NSView {
                 if total >= 7 { break }
             }
             func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
-            let totalW = groups.reduce(CGFloat(0)) { $0 + groupW($1.colors.count) }
-                + CGFloat(max(0, groups.count - 1)) * groupGap
-            var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
+            func capW(_ count: Int) -> CGFloat { groupW(count) + padX * 2 }
+            // Sessions sit as a tight cluster centred under the pet. The gap BETWEEN
+            // sessions ADAPTS to how many there are — a small gap for a couple,
+            // tighter when there are more — so the row always fits inside the pet's
+            // FIXED tile width (the pet never widens to fit the dots).
+            let capsTotal = groups.reduce(CGFloat(0)) { $0 + capW($1.colors.count) }
+            let sessionGap: CGFloat = {
+                guard groups.count > 1 else { return 0 }
+                let fit = (Self.tileWidth - 6 - capsTotal) / CGFloat(groups.count - 1)
+                return max(1, min(3, fit))
+            }()
+            let rowW = capsTotal + CGFloat(max(0, groups.count - 1)) * sessionGap
+            var cx0 = tileRect.midX - rowW / 2   // left edge of the first capsule
             for (gi, group) in groups.enumerated() {
-                let gw = groupW(group.colors.count)
-                let padX: CGFloat = 2         // one-dot capsule stays a tight circle (width == height)
-                let capH: CGFloat = 10        // hug the dots so the glow sits close, not far out
+                let w = capW(group.colors.count)
                 // "Running" glows the WHOLE session capsule in sync and ENLARGES it on
                 // a ~1s beat, so a multi-model session's adjacent dots share ONE
-                // coherent glow instead of per-dot rings that collide when the points
-                // sit next to each other. The capsule is a circle for a single model
-                // (padX makes width == height), a horizontal pill for several. The
-                // dots inside keep their constant provider colours.
+                // coherent glow. The capsule is a circle for a single model, a
+                // horizontal pill for several; the dots inside keep constant colours.
                 let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
                 let grow = 1.0 * g           // a gentle enlarge that stays within the tile (no clipping)
-                let cap = NSRect(x: x - padX - grow, y: cy - capH / 2 - grow,
-                                 width: gw + padX * 2 + grow * 2, height: capH + grow * 2)
+                let cap = NSRect(x: cx0 - grow, y: cy - capH / 2 - grow,
+                                 width: w + grow * 2, height: capH + grow * 2)
                 let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
                 NSColor.black.withAlphaComponent(0.4).setFill()
                 capPath.fill()
@@ -817,19 +824,18 @@ final class ActivityPetsView: NSView {
                 }
 
                 // Dots on top — crisp, constant provider colour, fixed size.
+                var dx = cx0 + padX
                 for color in group.colors {
-                    let cx = x + dotSize / 2
-                    let dotRect = NSRect(x: cx - dotSize / 2, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
                     color.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
                     let dot = NSBezierPath(ovalIn: dotRect)
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
-                    x += dotSize + innerGap
+                    dx += dotSize + innerGap
                 }
-                x -= innerGap       // drop the trailing inner gap
-                x += groupGap       // wider gap before the next session's capsule
+                cx0 += w + sessionGap
             }
         }
 
