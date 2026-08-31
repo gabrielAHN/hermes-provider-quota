@@ -789,25 +789,30 @@ final class ActivityPetsView: NSView {
                 capPath.lineWidth = 0.75
                 capPath.stroke()
 
-                // Make "running" obvious: a busy dot PULSES on a clear ~1s beat
-                // (size + brightness swing) so activity reads at a glance, plus a
-                // faster travelling crest (~0.8s/point) that glides the emphasis
-                // smoothly across a session's dots. An idle dot sits dim and static,
-                // so busy vs idle is unmistakable.
-                let n = Double(max(groups.count, 1))
-                let crest = Double(phase) / 8.0                        // one point per 8 ticks (~0.8s)
-                var d = (crest - Double(gi)).truncatingRemainder(dividingBy: n)
-                if d < 0 { d += n }
-                let emphasis = max(0.0, 1.0 - min(d, n - d))           // 1 at the crest → 0 away
-                let beat = (sin(Double(phase) * .pi / 5) + 1) * 0.5    // clear ~1s rhythmic pulse
-                let alpha: CGFloat = group.busy ? CGFloat(0.5 + 0.5 * max(Double(emphasis), beat)) : 0.4
-                let pulse: CGFloat = group.busy ? CGFloat(1.8 * beat + 1.0 * emphasis) : 0
-                let size = dotSize + pulse
-                for color in group.colors {
+                // "Running" is shown by a GLOWING BORDER that ENLARGES on a ~1s beat
+                // — the dot's colour and size never change, so it always reads as its
+                // provider; only the pulsing glow ring around it says "working".
+                for (ci, color) in group.colors.enumerated() {
                     let cx = x + dotSize / 2
-                    let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
-                    color.withAlphaComponent(alpha).setFill()
-                    dot.fill()
+                    let dotRect = NSRect(x: cx - dotSize / 2, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    if group.busy {
+                        let g = CGFloat((sin(Double(phase) * .pi / 5 + Double(gi) + Double(ci) * 0.6) + 1) * 0.5)
+                        let r = dotSize / 2 + 0.75 + 2.0 * g          // the border enlarges with the beat
+                        let ring = NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
+                        NSGraphicsContext.saveGraphicsState()
+                        let shadow = NSShadow()
+                        shadow.shadowColor = color.withAlphaComponent(0.9)   // glow in the dot's own colour
+                        shadow.shadowBlurRadius = 1.5 + 3.0 * g
+                        shadow.shadowOffset = .zero
+                        shadow.set()
+                        color.withAlphaComponent(0.4 + 0.5 * g).setStroke()
+                        ring.lineWidth = 1.3
+                        ring.stroke()
+                        NSGraphicsContext.restoreGraphicsState()
+                    }
+                    color.setFill()                                   // constant, solid provider colour
+                    NSBezierPath(ovalIn: dotRect).fill()
+                    let dot = NSBezierPath(ovalIn: dotRect)
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
