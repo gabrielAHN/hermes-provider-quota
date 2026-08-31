@@ -1,10 +1,15 @@
-# Quota Viewer iOS 👀
+# Quota Viewer 👀
 
-A macOS **menu-bar app** + **Hermes gateway plugin** that shows live account
-quota for your Hermes providers — **OpenRouter**, **Claude**, and **Codex** —
-with usage bars, reset times, and an animated **per-provider pet**.
+A macOS **GPU-rendered desktop app** (built on [gpuix](https://github.com/remorses/gpuix)
+— React bindings for Zed's GPUI) + **Hermes gateway plugin** that shows live
+account quota for your providers — **OpenRouter**, **Claude**, and **Codex** —
+with usage bars, reset times, and animated **per-session pets**. It renders
+natively on the GPU in a frosted-glass window (no Electron, no web view), and
+ships as a single self-contained binary.
 
-![Quota Viewer menu bar](docs/menubar.png)
+> Previously a menu-bar app (Swift/AppKit). It was fully rewritten on gpuix; the
+> app is now a standalone window, launched from the Dock/Spotlight, since gpuix
+> renders windows rather than menu-bar items.
 
 It works with **any Hermes gateway**: the app piggybacks on the Hermes Desktop
 app's own gateway URL + session, so it shows exactly what your Desktop can see
@@ -18,7 +23,7 @@ each, and you turn on the ones you want. The app uses **all enabled sources at
 once**, with no fallback: enable both and each source's providers are listed
 together under a small source header, so the same provider (e.g. Claude) can
 appear once per source. Disabling a chip drops that source's providers. With none
-enabled the menu says so; when a source is disconnected its providers still list
+enabled the window says so; when a source is disconnected its providers still list
 as **Disconnected**. Hermes has a gateway session, so it gets **Login** /
 **Logout** buttons; Local providers authenticate via their own CLIs
 (`claude login`, etc.).
@@ -37,9 +42,13 @@ as **Disconnected**. Hermes has a gateway session, so it gets **Login** /
     `is_active`), each with its model so the pet colours it per provider. Reads
     only the gateway's own logs + active-sessions registry (no session DB /
     internals), so it needs no privileged capabilities and stays enabled.
-- **`menubar/`** — the macOS menu-bar app. Every 60s it runs `desktop-quotas.sh`,
-  which resolves the gateway your Hermes **Desktop** is bound to and fetches the
-  endpoint. Portable (system `python3` + `openssl`), no extra deps.
+- **`gpuix-app/`** — the macOS window app (Bun + TypeScript + `@gpuix/react`).
+  Every 60s it shells out to `desktop-quotas.sh` (quotas) and every 1s to
+  `--activity` (live sessions), plus a native scan of local `claude`/`codex`/
+  `opencode` sessions for the Local pet. Pet spritesheets are decoded with
+  `fast-png` and frame-animated via a CSS-sprite clip. Build with
+  `bun run build` → one standalone binary; `install-app.sh` wraps it in
+  `~/Applications/Provider Quotas.app`.
 - **`local-quotas.sh`** — the **Local** source. When Local is enabled it reads
   each provider's usage API directly from the credentials on this Mac: Claude
   from `~/.claude/.credentials.json` or the login Keychain, Codex from `~/.codex`
@@ -69,12 +78,18 @@ On the machine running your Hermes gateway:
 On your Mac:
 
 ```bash
-./install-menubar.sh   # builds/installs the menu-bar app; if a Hermes gateway is
-                       # present on this same Mac it also runs install.sh for you
+./install-app.sh              # installs Bun if needed, builds the gpuix binary,
+                              # installs Provider Quotas.app + the data helpers;
+                              # if a Hermes gateway is present locally it also
+                              # runs install.sh for you
+./install-app.sh --login-item # (optional) also auto-open the window at login
 ```
 
+Then launch it from Spotlight/Dock (or `open -a "Provider Quotas"`). macOS may
+block the unsigned binary the first time — right-click the app, choose **Open**.
+
 For a **remote** gateway, run `install.sh` on the gateway host and
-`install-menubar.sh` on your Mac.
+`install-app.sh` on your Mac.
 
 ## Configuring providers (per gateway)
 
@@ -97,18 +112,15 @@ PROVIDER_QUOTA_PROVIDERS="anthropic=Claude,openrouter"
 
 ## Features
 
-- Each provider shows a brief row with a **bar graph in the provider's own
-  colour** (remaining quota); **click to expand** for per-window bars, reset
-  times, and details. Each row has an **eye toggle** for whether that provider's
-  dot appears in the **closed** menu bar, so you can keep only the ones you care
-  about up top.
-- The **closed menu-bar** shows a coloured dot per provider, **grouped by source
-  section** (an extra gap between Hermes and Local) so you can tell them apart at
-  a glance; a provider that's **offline or out of quota** gets a **bold red ring**
-  around its (still provider-coloured) dot. A provider that's connected but can't
-  read its usage right now (e.g. a transient HTTP 429) is **not** flagged red —
-  it keeps its last-known quota (cached up to 15 min) so a rate-limit blip doesn't
-  read as an outage.
+- The collapsed provider row shows the **current-session %** as a **bar in the
+  provider's own colour** (not the weekly/total), plus a status dot; **click to
+  expand** for per-window bars, reset times, and details. A provider that's
+  **offline or out of quota** gets a **bold red ring** around its status dot. A
+  provider that's connected but can't read its usage right now (e.g. a transient
+  HTTP 429) is **not** flagged — it keeps its last-known quota (cached up to
+  15 min) so a rate-limit blip doesn't read as an outage.
+- Each row has an **eye toggle** that hides that provider family's dots from the
+  **pet** (so you can keep the pet focused on the providers you care about).
 - When an enabled source is disconnected, its providers still list, each marked
   **Disconnected**, so you always see what's configured and what's down.
   Disabling a source (its chip) removes all providers linked to it.
@@ -120,47 +132,33 @@ PROVIDER_QUOTA_PROVIDERS="anthropic=Claude,openrouter"
   **"Activating …" spinner** in its place until its first quotas land.
 - **Per-source pets** — **one** animated companion **per source** (Hermes and
   Local), configured with two icon buttons **in the source header row**: a **paw**
-  that toggles the pet on/off and the **pet's own picture** (click it to switch to
-  the next installed pet) — two sources, two independently configured pets.
-  **Right-click** a pet for a quick menu: **Pet Size** (three sizes — Small /
-  Medium / Large — for the whole strip, remembered across launches) and **Turn
-  Off … Pet** (disables that source's pet and immediately syncs the menu's paw
-  toggle). Under
-  the pet is a row of session marks that appears **only while sessions are
-  actually running** — nothing when the source is idle. Each **actively-running**
-  session is **one dot in its provider's colour** (so several sessions → several
-  dots, and several of the same provider → several same-coloured dots); when a
-  session **finishes its dot simply disappears** (no lingering checkmark), so the
-  row only ever shows what's live right now. **Local**
-  reads the **`claude` and Codex sessions** on this Mac — for Claude it reads the
-  live turn state from the transcript's tail (a finished turn clears the dot at
-  once, no trailing lag), for Codex it watches `~/.codex` rollout freshness (with
-  a wider window, since Codex writes in bursts); **Hermes** scans **every gateway
-  profile's
-  recent sessions** and treats one as live from its **`is_active`** flag (the
-  gateway's real "working now" signal — idle/open sessions read false), so its dot
-  also **clears with no lag** the moment a turn ends, and colours it by that
-  session's **`billing_provider`**. That catches a **bot conversation** too (those
-  run as `source: cli` sessions that never show up in the aggregate
-  `active_agents`/`active_sessions` counters). Dots map **only to genuinely running
-  sessions** — the pet may animate as "working" when the Desktop is active (e.g.
-  while you sign in), but it shows **no dots** unless a session is actually live.
-  So a running **OpenRouter** session shows a **purple** dot
-  (Claude orange, Codex green, Copilot grey) — not a generic colour, and only
-  while it's live; the moment it finishes, the dot clears. Provider identity (colour, label,
-  icon) is drawn from one canonical map, so a provider like **Codex looks the same across
-  the Local and Hermes sources**. The picker offers **Nukey** (Hermes's default)
-  plus **Boba, Capy and Scoop** and whatever else is installed —
-  `install-menubar.sh` fetches those three from the
+  that toggles the pet on/off and a **switch** button (cycles to the next
+  installed pet). Pet **size** (Small / Medium / Large) persists across launches
+  (`petScale`). Under each pet is a row of session marks that appears **only while
+  sessions are actually running** — nothing when the source is idle. Each
+  **actively-running** session is a **rounded pill capsule** holding one **round
+  dot per model** the session is using, so a multi-model turn reads as a little
+  **cluster** of coloured dots grouped together; several sessions → several
+  capsules (capped at 7 dots). When a session **finishes, its dots simply
+  disappear** (no lingering checkmark). Each dot is coloured by its **model
+  family** — a running **OpenRouter** model is **purple** (Claude orange, Codex
+  green, Copilot grey) — resolved from one canonical map so a provider like
+  **Codex looks the same across the Local and Hermes sources**. **Hermes** reads
+  the gateway's live sessions from `--activity` (the plugin merges Desktop chats,
+  `tui_gateway` turns, and the active-sessions registry — catching **bot
+  conversations** that never hit the aggregate counters), keying "live" off
+  `is_active` with short grace windows so a dot clears promptly when a turn ends.
+  **Local** natively scans this Mac's `claude`/`codex`/`opencode` sessions
+  (process list + transcript/rollout freshness + the opencode SQLite db). The
+  picker offers **Nukey** (Hermes's default) plus **Boba, Capy and Scoop** and
+  whatever else is installed — `install-app.sh` fetches those three from the
   [petdex](https://petdex.dev) catalog Hermes itself uses, while the **Lulu**
-  capybaras and **cats** are hidden. Every pet animates via the shared
-  Hermes/petdex row taxonomy (idle / running / waiting / …); the app measures each
-  sheet's **per-row frame count** from its alpha, so pets with shorter rows (e.g.
-  the duck's 4-frame idle vs. Nukey's 8) loop cleanly instead of flickering
-  through blank cells, and it plays every frame of a row at a **steady ~5 fps**
-  (one frame per two redraw ticks, so each frame is held for exactly the same
-  time — even, never staggered). Pet art is loaded from your local Hermes install
-  / petdex and is not redistributed here.
+  capybaras and **cats** are hidden. Sheets are decoded with `fast-png` and the
+  app measures each sheet's **per-row frame count** from its alpha, so pets with
+  shorter rows (e.g. a 4-frame idle vs. Nukey's 8) loop cleanly instead of
+  flickering through blank cells, playing each row at a **steady ~5 fps** via a
+  CSS-sprite clip. Pet art is loaded from your local Hermes install / petdex and
+  is not redistributed here.
 - **Hermes and Local, together** — enable each source yourself (both off by
   default, nothing hardcoded); the app lists **all enabled sources at once**,
   grouped by source, so the same provider can appear once per source. No
@@ -168,12 +166,11 @@ PROVIDER_QUOTA_PROVIDERS="anthropic=Claude,openrouter"
 
 ## Requirements
 
-Despite the name, this is a **macOS** app (an AppKit menu-bar agent) — it does
-not run on iOS.
+This is a **macOS** desktop app (a gpuix/GPUI window) — it does not run on iOS.
 
 - **macOS 13 (Ventura) or later**.
-- **Xcode command-line tools** (`xcode-select --install`) — `install-menubar.sh`
-  compiles the app with `xcrun swiftc`.
+- **[Bun](https://bun.sh)** — `install-app.sh` builds the app with
+  `bun build --compile` (and installs Bun for you if it's missing).
 - **A source** — either:
   - **Hermes Desktop** installed and signed in (the app reuses its session and
     stores no credentials of its own), with a **Hermes gateway** running the

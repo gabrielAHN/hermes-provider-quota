@@ -1,8 +1,7 @@
 #!/bin/bash
-# Pull the latest from the repo this app was installed from, then reinstall the
-# menu-bar app (which also refreshes the gateway plugin when a local gateway is
-# present). Invoked by the menu-bar's "Check for Updates" action. Safe to run by
-# hand too.
+# Pull the latest from the repo this app was installed from, then rebuild + reinstall
+# the gpuix window app (which also refreshes the gateway plugin when a local gateway
+# is present). Invoked by the app's "Check for Updates" action. Safe to run by hand.
 set -euo pipefail
 
 service_home="$(cd "$(dirname "$0")" && pwd)"
@@ -15,4 +14,4 @@ if [ -z "$target" ]; then
 fi
 git merge --ff-only "$target"
 
-bash "$service_home/install-menubar.sh"
+bash "$service_home/install-app.sh"

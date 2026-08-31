@@ -300,9 +300,21 @@ def _openrouter_credits_provider(slug, label, key, source, reject_message):
     total = float(credits.get("total_credits") or 0.0)
     usage = float(credits.get("total_usage") or 0.0)
     remaining = max(0.0, total - usage)
-    window = _window("Account credits", None, remaining_amount=remaining, currency="USD",
-                     detail=f"${remaining:.2f} of ${total:.2f} left" if total > 0 else f"${remaining:.2f} available")
-    return _provider(slug, label, "ok", [window], source=source)
+    windows = [_window("Account credits", None, remaining_amount=remaining, currency="USD",
+                       detail=f"${remaining:.2f} of ${total:.2f} left" if total > 0 else f"${remaining:.2f} available")]
+    # Match the Hermes source, which lists an "API key quota" % window (the per-key
+    # spend limit) alongside the credit balance. OpenRouter's /api/v1/key returns
+    # the key's `limit` + `usage`; a null limit means "no cap" so we skip the window.
+    try:
+        kd = (_get("https://openrouter.ai/api/v1/key", headers, timeout=10).get("data") or {})
+        klimit, kusage = kd.get("limit"), kd.get("usage")
+        if isinstance(klimit, (int, float)) and klimit > 0 and isinstance(kusage, (int, float)):
+            used = min(100.0, max(0.0, kusage / klimit * 100.0))
+            windows.append(_window("API key quota", used,
+                                   detail=f"${max(0.0, klimit - kusage):.2f} of ${klimit:.2f} key limit left"))
+    except Exception:
+        pass
+    return _provider(slug, label, "ok", windows, source=source)
 
 
 def openrouter_provider():
