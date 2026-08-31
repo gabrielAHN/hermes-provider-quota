@@ -1026,6 +1026,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Provider colour (hex) per ACTIVE Hermes session, so its dots match the real
     // provider (e.g. OpenRouter purple) instead of a generic gateway colour.
     private var hermesSessionHexes: [String] = []
+    // Last local session scan, cached so an eye toggle can rebuild the pet
+    // synchronously (immediately) without waiting for the next 1s scan.
+    private var lastLocalSessions: [LocalSession] = []
     private var hermesActivityTimer: Timer?
     private var hermesPollInFlight = false
 
@@ -2217,6 +2220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let local = Self.fetchLocalActivity()
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.lastLocalSessions = local
                 self.activityPanel.show(self.buildSourcePetTiles(localSessions: local))
             }
         }
@@ -2970,6 +2974,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setProviderShownInMenuBar(kind, parts[1], !providerShownInMenuBar(kind, parts[1]))
         updateStatusItem()
         rebuildMenu()
+        // Reflect the change in the pet IMMEDIATELY — rebuild from the cached
+        // sessions (Hermes hexes + last local scan) with the new hidden filter, so
+        // a hidden provider's dots vanish on click, not on the next 1s poll.
+        activityPanel.show(buildSourcePetTiles(localSessions: lastLocalSessions))
     }
 
     @objc private func openGateway() {
