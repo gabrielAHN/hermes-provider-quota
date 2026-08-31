@@ -704,11 +704,11 @@ final class ActivityPetsView: NSView {
             // so a short row (e.g. the duck's 4-frame idle) loops cleanly instead
             // of stepping into blank cells. Fall back to 6 if we couldn't measure.
             let rowFrameCount = max(rowFrames.indices.contains(row) ? rowFrames[row] : 6, 1)
-            // Advance one frame every 2 redraw ticks — a calm ~5 fps where every
+            // Advance one frame every 3 redraw ticks — a calm ~3.3 fps where every
             // frame is held for exactly the same time, so the walk/idle cycle reads
-            // as steady, not staggered or rushed. (1680 is a multiple of every
-            // frame count, so the loop stays even across the phase wrap.)
-            let frame = (phase / 2) % rowFrameCount
+            // as slow and steady, not staggered or rushed. (1680/3 = 560 is still a
+            // multiple of every frame count, so the loop stays even across the wrap.)
+            let frame = (phase / 3) % rowFrameCount
             let source = NSRect(
                 x: CGFloat(frame) * frameWidth,
                 y: image.size.height - CGFloat(row + 1) * frameHeight,
@@ -789,10 +789,20 @@ final class ActivityPetsView: NSView {
                 capPath.lineWidth = 0.75
                 capPath.stroke()
 
-                let alpha: CGFloat = group.busy ? 1 : 0.55
-                let highlight = group.busy && gi == phase % max(groups.count, 1)
-                let pulse: CGFloat = group.busy ? CGFloat((sin(Double(phase) * .pi / 4 + Double(gi)) + 1) * 0.5) : 0
-                let size = dotSize + (highlight ? 1.0 : 0) + pulse
+                // A soft highlight that GLIDES across the session's dots instead of
+                // snapping — one point roughly every 1.6s — with a smooth swell in
+                // size + opacity around the moving crest, so the emphasis transitions
+                // gently from one point to the next. A slow per-dot "breathe" keeps a
+                // lone dot alive when there's nothing for the crest to travel across.
+                let n = Double(max(groups.count, 1))
+                let crest = Double(phase) / 16.0                       // one group per 16 ticks (~1.6s)
+                var d = (crest - Double(gi)).truncatingRemainder(dividingBy: n)
+                if d < 0 { d += n }
+                let emphasis = max(0.0, 1.0 - min(d, n - d))           // smooth 1→0 falloff around the crest
+                let breathe = (sin(Double(phase) * .pi / 12 + Double(gi)) + 1) * 0.5   // slow ~2.4s, per-dot offset
+                let alpha: CGFloat = group.busy ? CGFloat(0.55 + 0.45 * emphasis) : 0.5
+                let pulse: CGFloat = group.busy ? CGFloat(0.7 * emphasis + 0.5 * breathe) : 0
+                let size = dotSize + pulse
                 for color in group.colors {
                     let cx = x + dotSize / 2
                     let dot = NSBezierPath(ovalIn: NSRect(x: cx - size / 2, y: cy - size / 2, width: size, height: size))
@@ -2201,6 +2211,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 continue
             }
 
+            // Providers the user hid via the eye toggle shouldn't show a pet dot
+            // either — drop any dot whose colour belongs to a hidden provider, and
+            // drop a whole session mark when every one of its models is hidden.
+            let hiddenColors = Set((sources.first { $0.kind == kind }?.providers ?? [])
+                .filter { !providerShownInMenuBar(kind, $0.provider) }
+                .map { Self.providerHex($0.provider).lowercased() })
+            func visibleMark(_ hex: String) -> SessionMark? {
+                guard !hiddenColors.isEmpty else { return SessionMark(hex: hex, busy: true) }
+                let kept = hex.split(separator: ",").map(String.init)
+                    .filter { !hiddenColors.contains($0.lowercased()) }
+                return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: true)
+            }
+
             let marks: [SessionMark]
             let title: String
             let working: Bool
@@ -2208,13 +2231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // Dots map ONLY to real running sessions (is_active). Merely being
                 // connected — or the Desktop being active while you sign in — makes
                 // the pet WORK (hermesBusy) but shows NO dots.
-                marks = hermesSessionHexes.map { SessionMark(hex: $0, busy: true) }
+                marks = hermesSessionHexes.compactMap(visibleMark)
                 title = marks.isEmpty ? "" : "\(marks.count) agent\(marks.count == 1 ? "" : "s") running"
                 working = hermesBusy || !marks.isEmpty
             } else {
                 let busy = localSessions.filter { $0.busy }   // idle/open sessions show nothing
-                marks = busy.map { SessionMark(hex: $0.hex, busy: true) }
-                title = "\(busy.count) session\(busy.count == 1 ? "" : "s")"
+                marks = busy.compactMap { visibleMark($0.hex) }
+                title = "\(marks.count) session\(marks.count == 1 ? "" : "s")"
                 working = !marks.isEmpty
             }
 
