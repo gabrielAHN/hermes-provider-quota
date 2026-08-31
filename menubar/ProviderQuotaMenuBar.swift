@@ -755,8 +755,9 @@ final class ActivityPetsView: NSView {
             // session's dots. Total dots capped so the row fits under the pet.
             let dotSize: CGFloat = 6
             let innerGap: CGFloat = 1.5   // between models within a session
-            let groupGap: CGFloat = 9     // between session capsules
-            let cy = tileRect.minY + 7
+            let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
+            let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
+            let cy = tileRect.minY + 9    // a little clear of the bottom edge so the glow isn't clipped
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
             for mark in tile.sessions {
@@ -768,58 +769,73 @@ final class ActivityPetsView: NSView {
                 if total >= 7 { break }
             }
             func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
-            let totalW = groups.reduce(CGFloat(0)) { $0 + groupW($1.colors.count) }
-                + CGFloat(max(0, groups.count - 1)) * groupGap
-            var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
+            func capW(_ count: Int) -> CGFloat { groupW(count) + padX * 2 }
+            // Sessions sit as a tight cluster centred under the pet. The gap BETWEEN
+            // sessions ADAPTS to how many there are — a small gap for a couple,
+            // tighter when there are more — so the row always fits inside the pet's
+            // FIXED tile width (the pet never widens to fit the dots).
+            let capsTotal = groups.reduce(CGFloat(0)) { $0 + capW($1.colors.count) }
+            let sessionGap: CGFloat = {
+                guard groups.count > 1 else { return 0 }
+                let fit = (Self.tileWidth - 6 - capsTotal) / CGFloat(groups.count - 1)
+                return max(1, min(3, fit))
+            }()
+            let rowW = capsTotal + CGFloat(max(0, groups.count - 1)) * sessionGap
+            var cx0 = tileRect.midX - rowW / 2   // left edge of the first capsule
             for (gi, group) in groups.enumerated() {
-                let gw = groupW(group.colors.count)
-                // A rounded background border around THIS session's dots, so the
-                // model(s) it runs read as one bounded group. A HEIGHT-based corner
-                // radius gives fully-round ends — a perfect circle for a single-model
-                // session (padX makes its width == the height), a horizontal pill for
-                // several — instead of the squished vertical oval a fixed 6.5 radius
-                // on an 11×13 box produced.
-                let padX: CGFloat = 3
-                let capH: CGFloat = 12
-                let cap = NSRect(x: x - padX, y: cy - capH / 2, width: gw + padX * 2, height: capH)
-                let capPath = NSBezierPath(roundedRect: cap, xRadius: capH / 2, yRadius: capH / 2)
+                let w = capW(group.colors.count)
+                // "Running" glows the WHOLE session capsule in sync and ENLARGES it on
+                // a ~1s beat, so a multi-model session's adjacent dots share ONE
+                // coherent glow. The capsule is a circle for a single model, a
+                // horizontal pill for several; the dots inside keep constant colours.
+                let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
+                let grow = 1.0 * g           // a gentle enlarge that stays within the tile (no clipping)
+                let cap = NSRect(x: cx0 - grow, y: cy - capH / 2 - grow,
+                                 width: w + grow * 2, height: capH + grow * 2)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
                 NSColor.black.withAlphaComponent(0.4).setFill()
                 capPath.fill()
-                NSColor.white.withAlphaComponent(0.35).setStroke()
-                capPath.lineWidth = 0.75
-                capPath.stroke()
+                if group.busy {
+                    // Glow in the session's blended colour (its own colour for one
+                    // model), so the group reads as a single running unit.
+                    let glowColor: NSColor = {
+                        let rgb = group.colors.compactMap { $0.usingColorSpace(.sRGB) }
+                        guard let first = rgb.first else { return .white }
+                        if rgb.count == 1 { return first }
+                        let n = CGFloat(rgb.count)
+                        return NSColor(srgbRed: rgb.map { $0.redComponent }.reduce(0, +) / n,
+                                       green: rgb.map { $0.greenComponent }.reduce(0, +) / n,
+                                       blue: rgb.map { $0.blueComponent }.reduce(0, +) / n, alpha: 1)
+                    }()
+                    NSGraphicsContext.saveGraphicsState()
+                    let shadow = NSShadow()
+                    shadow.shadowColor = glowColor.withAlphaComponent(0.95)
+                    shadow.shadowBlurRadius = 0.5 + 2.0 * g   // tighter glow, hugging the dots
+                    shadow.shadowOffset = .zero
+                    shadow.set()
+                    glowColor.withAlphaComponent(0.55 + 0.4 * g).setStroke()
+                    capPath.lineWidth = 1.3
+                    capPath.stroke()
+                    NSGraphicsContext.restoreGraphicsState()
+                } else {
+                    NSColor.white.withAlphaComponent(0.35).setStroke()
+                    capPath.lineWidth = 0.75
+                    capPath.stroke()
+                }
 
-                // "Running" is shown by a GLOWING BORDER that ENLARGES on a ~1s beat
-                // — the dot's colour and size never change, so it always reads as its
-                // provider; only the pulsing glow ring around it says "working".
-                for (ci, color) in group.colors.enumerated() {
-                    let cx = x + dotSize / 2
-                    let dotRect = NSRect(x: cx - dotSize / 2, y: cy - dotSize / 2, width: dotSize, height: dotSize)
-                    if group.busy {
-                        let g = CGFloat((sin(Double(phase) * .pi / 5 + Double(gi) + Double(ci) * 0.6) + 1) * 0.5)
-                        let r = dotSize / 2 + 0.75 + 2.0 * g          // the border enlarges with the beat
-                        let ring = NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
-                        NSGraphicsContext.saveGraphicsState()
-                        let shadow = NSShadow()
-                        shadow.shadowColor = color.withAlphaComponent(0.9)   // glow in the dot's own colour
-                        shadow.shadowBlurRadius = 1.5 + 3.0 * g
-                        shadow.shadowOffset = .zero
-                        shadow.set()
-                        color.withAlphaComponent(0.4 + 0.5 * g).setStroke()
-                        ring.lineWidth = 1.3
-                        ring.stroke()
-                        NSGraphicsContext.restoreGraphicsState()
-                    }
-                    color.setFill()                                   // constant, solid provider colour
+                // Dots on top — crisp, constant provider colour, fixed size.
+                var dx = cx0 + padX
+                for color in group.colors {
+                    let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    color.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
                     let dot = NSBezierPath(ovalIn: dotRect)
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
-                    x += dotSize + innerGap
+                    dx += dotSize + innerGap
                 }
-                x -= innerGap       // drop the trailing inner gap
-                x += groupGap       // wider gap before the next session's capsule
+                cx0 += w + sessionGap
             }
         }
 
@@ -1171,25 +1187,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
-        // Hidden via the eye → a minimal row: just the provider NAME + the eye
-        // (dimmed). It stays in the menu so you can re-enable it, but drops all of
-        // its quota info, and isn't expandable.
+        // Hidden via the eye → a minimal row: just the provider NAME + a dimmed
+        // eye.slash. It drops all quota info and isn't expandable — and the WHOLE
+        // row is clickable to reveal the provider again (not only the eye).
         if !providerShownInMenuBar(kind, provider.provider) {
             let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
             row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
                                  font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
-            let eyeOff = NSButton(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
-            eyeOff.isBordered = false
-            eyeOff.title = ""
-            eyeOff.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click to show")
-            eyeOff.imagePosition = .imageOnly
-            eyeOff.imageScaling = .scaleProportionallyDown
-            eyeOff.contentTintColor = .tertiaryLabelColor
-            eyeOff.identifier = NSUserInterfaceItemIdentifier(key)
-            eyeOff.target = self
-            eyeOff.action = #selector(toggleProviderMenuBar(_:))
-            eyeOff.toolTip = "Show \(provider.label) again"
-            row.addSubview(eyeOff)
+            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            eyeIcon.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click the row to show")
+            eyeIcon.imageScaling = .scaleProportionallyDown
+            eyeIcon.contentTintColor = .tertiaryLabelColor
+            row.addSubview(eyeIcon)
+            // Whole-row reveal button on top: click anywhere to show the provider.
+            let reveal = NSButton(frame: row.bounds)
+            reveal.isBordered = false
+            reveal.title = ""
+            reveal.identifier = NSUserInterfaceItemIdentifier(key)
+            reveal.target = self
+            reveal.action = #selector(toggleProviderMenuBar(_:))
+            reveal.toolTip = "Show \(provider.label) again"
+            row.addSubview(reveal)
             return row
         }
 

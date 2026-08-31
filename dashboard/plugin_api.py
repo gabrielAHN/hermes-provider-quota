@@ -285,6 +285,10 @@ _RE_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 _RE_TUI_START = re.compile(r"tui prompt accepted:.*agent_session_id=(\S+)")
 _RE_TUI_END = re.compile(r"tui turn (?:finished|failed|cancell?ed|aborted|error):.*agent_session_id=(\S+)")
 _RE_MODEL = re.compile(r"\[(\d{8}_\d{6}_[0-9a-fA-F]+)\].*?model=(\S+)\s+provider=(\S+)")
+# A turn (top-level OR a background/skill-review/subagent turn) opens with
+# "conversation turn: session=X" and closes with "Turn ended: ... session=X".
+_RE_TURN_START = re.compile(r"conversation turn: session=(\S+)")
+_RE_TURN_END = re.compile(r"Turn ended:.*?\bsession=(\S+)")
 
 
 def _hermes_home() -> Path:
@@ -337,6 +341,34 @@ def _active_tui_sessions(home: Path, now: float) -> dict[str, dict[str, Any]]:
         sid: {"started_at": ts, "surface": "tui"}
         for sid, (ts, kind) in state.items()
         if kind == "start"
+    }
+
+
+def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
+    # A session is RUNNING while it's mid-turn: from "conversation turn: session=X"
+    # until the matching "Turn ended: ... session=X". This catches turns the tui +
+    # lease paths miss — background/skill-review turns that run AFTER a tui turn is
+    # marked finished, SUBAGENT turns (their model calls log under the parent
+    # session), and bot/cli turns that hold no desktop lease — and keeps a session
+    # lit through long reasoning/tool gaps between API calls (explicit start/end
+    # means a finished turn never lingers).
+    start: dict[str, float] = {}
+    end: dict[str, float] = {}
+    for line in _tail_text(home / "logs" / "agent.log").splitlines():
+        ts = _log_ts(line)
+        if ts is None or now - ts > _ACTIVITY_MAX_AGE:
+            continue
+        m = _RE_TURN_START.search(line)
+        if m:
+            start[m.group(1)] = ts
+            continue
+        m = _RE_TURN_END.search(line)
+        if m:
+            end[m.group(1)] = ts
+    return {
+        sid: {"started_at": ts, "surface": "agent"}
+        for sid, ts in start.items()
+        if ts > end.get(sid, 0.0)
     }
 
 
@@ -412,14 +444,19 @@ def activity() -> dict[str, Any]:
     # In-flight tui turns (latest gui.log event is a prompt-accepted, not a
     # turn-finished) are running by definition.
     tui = _active_tui_sessions(home, now)
+    # Sessions mid-turn per agent.log — catches background/skill-review and SUBAGENT
+    # turns (and bot/cli turns) that aren't tui turns and may hold no lease.
+    turns = _active_agent_turns(home, now)
+    active: dict[str, dict[str, Any]] = dict(tui)
+    for sid, info in turns.items():
+        active.setdefault(sid, info)
     # Desktop leases are candidates — but only "running" with RECENT log activity,
     # so a stale lease the gateway never released is dropped (the phantom session).
     leases = _registry_sessions(home)
-    lease_recent = _recent_session_ids(home, set(leases) - set(tui), _LEASE_ACTIVE_WINDOW, now)
-    active: dict[str, dict[str, Any]] = dict(tui)
+    lease_recent = _recent_session_ids(home, set(leases) - set(active), _LEASE_ACTIVE_WINDOW, now)
     for sid, info in leases.items():
-        if sid in tui or sid in lease_recent:
-            active[sid] = info
+        if sid in active or sid in lease_recent:
+            active.setdefault(sid, info)
     models = _models_for(home, set(active))
     out = []
     for sid, info in active.items():
