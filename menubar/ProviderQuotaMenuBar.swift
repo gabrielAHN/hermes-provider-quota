@@ -757,7 +757,7 @@ final class ActivityPetsView: NSView {
             let innerGap: CGFloat = 1.5   // between models within a session
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
-            let cy = tileRect.minY + 9    // a little clear of the bottom edge so the glow isn't clipped
+            let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
             for mark in tile.sessions {
@@ -805,11 +805,11 @@ final class ActivityPetsView: NSView {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
                     if group.busy {
                         color.withAlphaComponent(0.22).setFill()
-                        NSBezierPath(ovalIn: dotRect.insetBy(dx: -1.5 - g, dy: -1.5 - g)).fill()
+                        NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5 - g, dy: -2.5 - g)).fill()
                         NSGraphicsContext.saveGraphicsState()
                         let shadow = NSShadow()
                         shadow.shadowColor = color.withAlphaComponent(0.95)
-                        shadow.shadowBlurRadius = 1.5 + 2.0 * g
+                        shadow.shadowBlurRadius = 2.5 + 2.5 * g
                         shadow.shadowOffset = .zero
                         shadow.set()
                         color.setFill()
@@ -1553,11 +1553,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if active {
             // Soft colour wash so the glow reads clearly IN the provider's colour.
             color.withAlphaComponent(0.22).setFill()
-            NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5, dy: -2.5)).fill()
+            NSBezierPath(ovalIn: dotRect.insetBy(dx: -3.5, dy: -3.5)).fill()
             NSGraphicsContext.current?.saveGraphicsState()
             let shadow = NSShadow()
             shadow.shadowColor = color.withAlphaComponent(0.95)
-            shadow.shadowBlurRadius = 3
+            shadow.shadowBlurRadius = 3.6
             shadow.shadowOffset = .zero
             shadow.set()
             color.setFill()
@@ -1674,9 +1674,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // source contributes only the providers you haven't hidden with the eye.
         let step: CGFloat = 15      // per-dot advance
         let sectionGap: CGFloat = 9 // extra space between source sections
-        let height: CGFloat = 18    // taller than the 11px dot so an active dot's glow fits
-        let dotY: CGFloat = 3.5
-        let lead: CGFloat = 4       // horizontal padding so an edge dot's glow isn't clipped
+        let height: CGFloat = 21    // taller than the 11px dot so an active dot's glow fits
+        let dotY: CGFloat = 5
+        let lead: CGFloat = 6       // horizontal padding so an edge dot's glow isn't clipped
         let sections: [(kind: GatewayKind, connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
             let visible = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
             return visible.isEmpty ? nil : (source.kind, source.connected, visible)
