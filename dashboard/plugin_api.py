@@ -312,6 +312,24 @@ def _tail_text(path: Path, max_bytes: int = 262144) -> str:
         return ""
 
 
+def _log_dirs(home: Path) -> list[Path]:
+    # The default profile logs to ~/.hermes/logs; each named profile (e.g. a
+    # channel/ACP BOT running under `helper`) has its own ~/.hermes/profiles/<p>/logs.
+    dirs = [home / "logs"]
+    try:
+        dirs += sorted((home / "profiles").glob("*/logs"))
+    except Exception:
+        pass
+    return [d for d in dirs if d.is_dir()]
+
+
+def _read_log(home: Path, name: str) -> str:
+    # Tail `<name>` from the root AND every profile's log dir, so a session running
+    # under ANY profile is seen — not just the default profile's root logs. The
+    # per-line age filters downstream drop stale profiles' old lines.
+    return "\n".join(_tail_text(d / name) for d in _log_dirs(home))
+
+
 def _log_ts(line: str) -> float | None:
     m = _RE_LOG_TS.match(line)
     if not m:
@@ -326,7 +344,7 @@ def _log_ts(line: str) -> float | None:
 
 def _active_tui_sessions(home: Path, now: float) -> dict[str, dict[str, Any]]:
     state: dict[str, tuple[float, str]] = {}
-    for line in _tail_text(home / "logs" / "gui.log").splitlines():
+    for line in _read_log(home, "gui.log").splitlines():
         ts = _log_ts(line)
         if ts is None or now - ts > _ACTIVITY_MAX_AGE:
             continue
@@ -354,7 +372,7 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
     # means a finished turn never lingers).
     start: dict[str, float] = {}
     end: dict[str, float] = {}
-    for line in _tail_text(home / "logs" / "agent.log").splitlines():
+    for line in _read_log(home, "agent.log").splitlines():
         ts = _log_ts(line)
         if ts is None or now - ts > _ACTIVITY_MAX_AGE:
             continue
@@ -401,7 +419,7 @@ def _models_for(home: Path, sids: set[str]) -> dict[str, list[tuple[str, str]]]:
     if not sids:
         return {}
     out: dict[str, list[tuple[str, str]]] = {}
-    for line in _tail_text(home / "logs" / "agent.log").splitlines():
+    for line in _read_log(home, "agent.log").splitlines():
         m = _RE_MODEL.search(line)
         if m and m.group(1) in sids:
             pair = (m.group(2), m.group(3))
@@ -425,7 +443,7 @@ def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -
         return set()
     recent: set[str] = set()
     for name in ("agent.log", "gui.log"):
-        for line in _tail_text(home / "logs" / name).splitlines():
+        for line in _read_log(home, name).splitlines():
             ts = _log_ts(line)
             if ts is None or now - ts > window:
                 continue
