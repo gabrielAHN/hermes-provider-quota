@@ -793,11 +793,11 @@ final class ActivityPetsView: NSView {
                 let cap = NSRect(x: cx0 - grow, y: cy - capH / 2 - grow,
                                  width: w + grow * 2, height: capH + grow * 2)
                 let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
-                NSColor.black.withAlphaComponent(0.4).setFill()
-                capPath.fill()
                 if group.busy {
-                    // Glow in the session's blended colour (its own colour for one
-                    // model), so the group reads as a single running unit.
+                    // A pure GLOW — no border line: the dark pill casts a soft coloured
+                    // shadow in the session's blended colour (its own colour for one
+                    // model) that pulses + enlarges on the beat, so the group reads as
+                    // one glowing running unit.
                     let glowColor: NSColor = {
                         let rgb = group.colors.compactMap { $0.usingColorSpace(.sRGB) }
                         guard let first = rgb.first else { return .white }
@@ -810,17 +810,15 @@ final class ActivityPetsView: NSView {
                     NSGraphicsContext.saveGraphicsState()
                     let shadow = NSShadow()
                     shadow.shadowColor = glowColor.withAlphaComponent(0.95)
-                    shadow.shadowBlurRadius = 0.5 + 2.0 * g   // tighter glow, hugging the dots
+                    shadow.shadowBlurRadius = 1.0 + 2.5 * g
                     shadow.shadowOffset = .zero
                     shadow.set()
-                    glowColor.withAlphaComponent(0.55 + 0.4 * g).setStroke()
-                    capPath.lineWidth = 1.3
-                    capPath.stroke()
+                    NSColor.black.withAlphaComponent(0.5).setFill()   // dark backing casts the glow
+                    capPath.fill()
                     NSGraphicsContext.restoreGraphicsState()
                 } else {
-                    NSColor.white.withAlphaComponent(0.35).setStroke()
-                    capPath.lineWidth = 0.75
-                    capPath.stroke()
+                    NSColor.black.withAlphaComponent(0.3).setFill()
+                    capPath.fill()
                 }
 
                 // Dots on top — crisp, constant provider colour, fixed size.
@@ -1184,6 +1182,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // remaining). Click toggles the expanded per-window detail. `connected` is the
     // provider's SOURCE state (so a provider from a down source reads red even if
     // the other source is up).
+    // Colours of the sessions running RIGHT NOW for a source (the same feed that
+    // lights the pet). Used to glow an "effective" (actively-running) provider in
+    // the menu, matching the pet.
+    private func activeSessionColors(_ kind: GatewayKind) -> Set<String> {
+        var colors = Set<String>()
+        if kind == .hermes {
+            for hex in hermesSessionHexes {
+                for c in hex.split(separator: ",") { colors.insert(String(c).lowercased()) }
+            }
+        } else {
+            for s in lastLocalSessions where s.busy { colors.insert(s.hex.lowercased()) }
+        }
+        return colors
+    }
+
+    private func providerActive(_ kind: GatewayKind, _ slug: String) -> Bool {
+        activeSessionColors(kind).contains(Self.providerHex(slug).lowercased())
+    }
+
+    // A status dot with a bold, clearly-COLOURED glow baked into the image, for an
+    // actively-running provider in the menu. Drawn (not a layer shadow) so it always
+    // renders inside the NSMenu, and a soft colour wash makes the provider's own
+    // colour apparent.
+    private func glowingDotImage(_ provider: QuotaProvider, connected: Bool, canvas: CGFloat) -> NSImage {
+        let dot: CGFloat = 14
+        let base = providerDotImage(provider, size: dot, connected: connected)
+        let rect = NSRect(x: (canvas - dot) / 2, y: (canvas - dot) / 2, width: dot, height: dot)
+        let color = providerBrandColor(provider)
+        let img = NSImage(size: NSSize(width: canvas, height: canvas))
+        img.lockFocus()
+        // Soft colour wash halo behind, so the glow reads clearly IN the provider's colour.
+        color.withAlphaComponent(0.30).setFill()
+        NSBezierPath(ovalIn: rect.insetBy(dx: -6, dy: -6)).fill()
+        // Bold shadow-glow, drawn twice to strengthen it.
+        for _ in 0..<2 {
+            NSGraphicsContext.current?.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = color.withAlphaComponent(0.95)
+            shadow.shadowBlurRadius = 6
+            shadow.shadowOffset = .zero
+            shadow.set()
+            base.draw(in: rect)
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
+        base.draw(in: rect)   // crisp dot on top
+        img.unlockFocus()
+        return img
+    }
+
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
@@ -1228,9 +1275,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let plan = provider.plan {
             view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
         }
-        let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
-        statusImage.image = providerDotImage(provider, size: 14, connected: connected)
-        view.addSubview(statusImage)
+        // Status dot — and if this provider has a session running RIGHT NOW (its
+        // colour is live in the pet, INCLUDING as one model of a multi-model
+        // session), draw it with a bold coloured glow BAKED INTO the image so it
+        // renders reliably in the menu (a layer shadow doesn't, inside an NSMenu).
+        if providerActive(kind, provider.provider) {
+            let canvas: CGFloat = 34
+            let glowView = NSImageView(frame: NSRect(x: 329 - canvas / 2, y: 34 - canvas / 2, width: canvas, height: canvas))
+            glowView.image = glowingDotImage(provider, connected: connected, canvas: canvas)
+            view.addSubview(glowView)
+        } else {
+            let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
+            statusImage.image = providerDotImage(provider, size: 14, connected: connected)
+            view.addSubview(statusImage)
+        }
         // Brief line: summary text + an overall provider-coloured bar. Same font
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
