@@ -757,7 +757,7 @@ final class ActivityPetsView: NSView {
             let innerGap: CGFloat = 1.5   // between models within a session
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
-            let cy = tileRect.minY + 9    // a little clear of the bottom edge so the glow isn't clipped
+            let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
             var groups: [(colors: [NSColor], busy: Bool)] = []
             var total = 0
             for mark in tile.sessions {
@@ -789,44 +789,34 @@ final class ActivityPetsView: NSView {
                 // coherent glow. The capsule is a circle for a single model, a
                 // horizontal pill for several; the dots inside keep constant colours.
                 let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
-                let grow = 1.0 * g           // a gentle enlarge that stays within the tile (no clipping)
-                let cap = NSRect(x: cx0 - grow, y: cy - capH / 2 - grow,
-                                 width: w + grow * 2, height: capH + grow * 2)
+                // Subtle dark backing pill groups a session's dots — no glow / no border
+                // on the pill itself; the GLOW is on each POINT (below), in the point's
+                // OWN provider colour, matching the menu-bar dots.
+                let cap = NSRect(x: cx0, y: cy - capH / 2, width: w, height: capH)
                 let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
-                NSColor.black.withAlphaComponent(0.4).setFill()
+                NSColor.black.withAlphaComponent(group.busy ? 0.42 : 0.3).setFill()
                 capPath.fill()
-                if group.busy {
-                    // Glow in the session's blended colour (its own colour for one
-                    // model), so the group reads as a single running unit.
-                    let glowColor: NSColor = {
-                        let rgb = group.colors.compactMap { $0.usingColorSpace(.sRGB) }
-                        guard let first = rgb.first else { return .white }
-                        if rgb.count == 1 { return first }
-                        let n = CGFloat(rgb.count)
-                        return NSColor(srgbRed: rgb.map { $0.redComponent }.reduce(0, +) / n,
-                                       green: rgb.map { $0.greenComponent }.reduce(0, +) / n,
-                                       blue: rgb.map { $0.blueComponent }.reduce(0, +) / n, alpha: 1)
-                    }()
-                    NSGraphicsContext.saveGraphicsState()
-                    let shadow = NSShadow()
-                    shadow.shadowColor = glowColor.withAlphaComponent(0.95)
-                    shadow.shadowBlurRadius = 0.5 + 2.0 * g   // tighter glow, hugging the dots
-                    shadow.shadowOffset = .zero
-                    shadow.set()
-                    glowColor.withAlphaComponent(0.55 + 0.4 * g).setStroke()
-                    capPath.lineWidth = 1.3
-                    capPath.stroke()
-                    NSGraphicsContext.restoreGraphicsState()
-                } else {
-                    NSColor.white.withAlphaComponent(0.35).setStroke()
-                    capPath.lineWidth = 0.75
-                    capPath.stroke()
-                }
 
-                // Dots on top — crisp, constant provider colour, fixed size.
+                // Each point glows in ITS OWN colour: a soft colour wash + a shadow-glow
+                // that pulses + enlarges on the beat — one glowing dot for a single model,
+                // two adjacent glowing dots (each its colour) for a multi-model session.
                 var dx = cx0 + padX
                 for color in group.colors {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    if group.busy {
+                        color.withAlphaComponent(0.22).setFill()
+                        NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5 - g, dy: -2.5 - g)).fill()
+                        NSGraphicsContext.saveGraphicsState()
+                        let shadow = NSShadow()
+                        shadow.shadowColor = color.withAlphaComponent(0.95)
+                        shadow.shadowBlurRadius = 2.5 + 2.5 * g
+                        shadow.shadowOffset = .zero
+                        shadow.set()
+                        color.setFill()
+                        NSBezierPath(ovalIn: dotRect).fill()
+                        NSBezierPath(ovalIn: dotRect).fill()
+                        NSGraphicsContext.restoreGraphicsState()
+                    }
                     color.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
                     let dot = NSBezierPath(ovalIn: dotRect)
@@ -1184,6 +1174,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // remaining). Click toggles the expanded per-window detail. `connected` is the
     // provider's SOURCE state (so a provider from a down source reads red even if
     // the other source is up).
+    // Colours of the sessions running RIGHT NOW for a source (the same feed that
+    // lights the pet). Used to glow an "effective" (actively-running) provider in
+    // the menu, matching the pet.
+    private func activeSessionColors(_ kind: GatewayKind) -> Set<String> {
+        var colors = Set<String>()
+        if kind == .hermes {
+            for hex in hermesSessionHexes {
+                for c in hex.split(separator: ",") { colors.insert(String(c).lowercased()) }
+            }
+        } else {
+            for s in lastLocalSessions where s.busy { colors.insert(s.hex.lowercased()) }
+        }
+        return colors
+    }
+
+    private func providerActive(_ kind: GatewayKind, _ slug: String) -> Bool {
+        activeSessionColors(kind).contains(Self.providerHex(slug).lowercased())
+    }
+
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
@@ -1535,10 +1544,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Draws a provider status dot into the current context: the dot in the
     // provider's own colour, and — when it's OFFLINE or OUT OF QUOTA — a bold red
     // ring drawn OUTSIDE it (with a clear gap) so the alert reads at a glance.
-    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool) {
+    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool, active: Bool = false) {
         let s = rect.width
         let fillInset = bad ? s * 0.26 : s * 0.12
-        let fill = NSBezierPath(ovalIn: rect.insetBy(dx: fillInset, dy: fillInset))
+        let dotRect = rect.insetBy(dx: fillInset, dy: fillInset)
+        // A provider running a session RIGHT NOW glows its menu-bar dot in its own
+        // colour (matches the pet's session glow).
+        if active {
+            // Soft colour wash so the glow reads clearly IN the provider's colour.
+            color.withAlphaComponent(0.22).setFill()
+            NSBezierPath(ovalIn: dotRect.insetBy(dx: -3.5, dy: -3.5)).fill()
+            NSGraphicsContext.current?.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = color.withAlphaComponent(0.95)
+            shadow.shadowBlurRadius = 3.6
+            shadow.shadowOffset = .zero
+            shadow.set()
+            color.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            NSBezierPath(ovalIn: dotRect).fill()   // second pass strengthens the glow
+            NSGraphicsContext.current?.restoreGraphicsState()
+        }
+        let fill = NSBezierPath(ovalIn: dotRect)
         color.setFill()
         fill.fill()
         if bad {
@@ -1647,18 +1674,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // source contributes only the providers you haven't hidden with the eye.
         let step: CGFloat = 15      // per-dot advance
         let sectionGap: CGFloat = 9 // extra space between source sections
-        let sections: [(connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
+        let height: CGFloat = 21    // taller than the 11px dot so an active dot's glow fits
+        let dotY: CGFloat = 5
+        let lead: CGFloat = 6       // horizontal padding so an edge dot's glow isn't clipped
+        let sections: [(kind: GatewayKind, connected: Bool, providers: [QuotaProvider])] = sources.compactMap { source in
             let visible = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
-            return visible.isEmpty ? nil : (source.connected, visible)
+            return visible.isEmpty ? nil : (source.kind, source.connected, visible)
         }
         let dotCount = sections.reduce(0) { $0 + $1.providers.count }
 
         if dotCount == 0 {
-            let image = NSImage(size: NSSize(width: 15, height: 15))
+            let image = NSImage(size: NSSize(width: 15, height: height))
             image.lockFocus()
             let color = anyConnected ? NSColor.tertiaryLabelColor : NSColor.hermesRed
             color.setStroke()
-            let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: 2, width: 11, height: 11))
+            let dot = NSBezierPath(ovalIn: NSRect(x: 2, y: dotY, width: 11, height: 11))
             dot.lineWidth = 2
             dot.stroke()
             image.unlockFocus()
@@ -1666,15 +1696,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return image
         }
 
-        let width = CGFloat(dotCount) * step + CGFloat(max(0, sections.count - 1)) * sectionGap + 2
-        let image = NSImage(size: NSSize(width: width, height: 15))
+        let width = CGFloat(dotCount) * step + CGFloat(max(0, sections.count - 1)) * sectionGap + lead * 2
+        let image = NSImage(size: NSSize(width: width, height: height))
         image.lockFocus()
-        var x: CGFloat = 2
+        var x: CGFloat = lead
         for (index, section) in sections.enumerated() {
             for provider in section.providers {
-                drawProviderDot(in: NSRect(x: x, y: 2, width: 11, height: 11),
+                drawProviderDot(in: NSRect(x: x, y: dotY, width: 11, height: 11),
                                 color: providerBrandColor(provider.provider),
-                                bad: providerAlarming(provider, connected: section.connected))
+                                bad: providerAlarming(provider, connected: section.connected),
+                                active: providerActive(section.kind, provider.provider))
                 x += step
             }
             if index < sections.count - 1 { x += sectionGap }
@@ -1910,9 +1941,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Check the repo this app was installed from for newer commits; if behind,
     // offer to pull the latest and reinstall (rebuilds + relaunches the app). The
     // update runs DETACHED so it survives the app being booted out mid-reinstall.
+    // A Homebrew install has no git checkout — its update path is `brew upgrade`.
+    private func homebrewInstalled() -> Bool {
+        Bundle.main.bundlePath.contains("/Cellar/provider-quotas/")
+    }
+
+    private func brewExecutable() -> String? {
+        ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
     @objc private func checkForUpdates() {
         guard let repo = sourceRepoPath() else {
-            Self.notify("Update unavailable", "Reinstall from a git clone of the repo (run install-menubar.sh) to enable in-app updates.")
+            // Homebrew install → `brew upgrade` (then restart the service).
+            if homebrewInstalled(), let brew = brewExecutable() {
+                Self.notify("Updating…", "brew upgrade provider-quotas")
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let up = Self.run(brew, ["upgrade", "provider-quotas"])
+                    if up.code == 0 { _ = Self.run(brew, ["services", "restart", "provider-quotas"]) }
+                    DispatchQueue.main.async {
+                        Self.notify(up.code == 0 ? "Updated" : "Update finished",
+                                    up.out.isEmpty ? "brew upgrade provider-quotas" : String(up.out.suffix(300)))
+                    }
+                }
+                return
+            }
+            Self.notify("Update unavailable", "Reinstall from a git clone (install-menubar.sh), or `brew upgrade provider-quotas`.")
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
@@ -2162,7 +2215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func syncPetsFromGateway() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let fm = FileManager.default
-            let helper = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+            let helper = Self.helperPath("hermes-desktop-quotas")
             guard fm.isExecutableFile(atPath: helper) else { return }
             guard let listData = Self.runHelper(helper, ["/api/plugins/provider-quota/pets"]),
                   let obj = try? JSONSerialization.jsonObject(with: listData) as? [String: Any],
@@ -2240,7 +2293,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.lastLocalSessions = local
                 self.activityPanel.show(self.buildSourcePetTiles(localSessions: local))
+                self.refreshStatusDotsIfActiveChanged()
             }
+        }
+    }
+
+    // Redraw the menu-bar dots only when the set of actively-running providers
+    // changes, so their session glow stays live (~1s) without a needless redraw
+    // every tick.
+    private var lastActiveSignature = ""
+    private func refreshStatusDotsIfActiveChanged() {
+        let sig = activeSessionColors(.hermes).union(activeSessionColors(.local)).sorted().joined(separator: ",")
+        if sig != lastActiveSignature {
+            lastActiveSignature = sig
+            updateStatusItem()
         }
     }
 
@@ -2316,8 +2382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // `billing_provider` — so OpenRouter shows purple, Codex green, etc. Works for
     // a REMOTE gateway, where sessions run server-side.
     private static func fetchGatewayActivity() -> (busy: Bool, agents: Int, sessionHexes: [String]) {
-        let helper = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/hermes-desktop-quotas").path
+        let helper = helperPath("hermes-desktop-quotas")
         guard FileManager.default.isExecutableFile(atPath: helper) else {
             return (false, 0, [])
         }
@@ -2792,12 +2857,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
+    // Locate a helper across the places the installers put it: ~/.local/bin
+    // (install-menubar.sh) and Homebrew's bin (brew install). First existing +
+    // executable wins; falls back to ~/.local/bin.
+    static func helperPath(_ name: String) -> String {
+        let fm = FileManager.default
+        let fallback = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/\(name)").path
+        var candidates = [fallback, "/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)"]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            candidates += path.split(separator: ":").map { "\($0)/\(name)" }
+        }
+        return candidates.first { fm.isExecutableFile(atPath: $0) } ?? fallback
+    }
+
     private static func runHelper(_ name: String) -> Result<QuotaPayload, Error> {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
-        let helper = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/\(name)").path
+        let helper = helperPath(name)
         guard FileManager.default.isExecutableFile(atPath: helper) else {
             return .failure(NSError(domain: "ProviderQuotaMenuBar", code: 127, userInfo: [NSLocalizedDescriptionKey: "\(name) is not installed"]))
         }
