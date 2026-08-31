@@ -773,44 +773,54 @@ final class ActivityPetsView: NSView {
             var x = tileRect.midX - totalW / 2   // left edge of the first group's dots
             for (gi, group) in groups.enumerated() {
                 let gw = groupW(group.colors.count)
-                // A rounded background border around THIS session's dots, so the
-                // model(s) it runs read as one bounded group. A HEIGHT-based corner
-                // radius gives fully-round ends — a perfect circle for a single-model
-                // session (padX makes its width == the height), a horizontal pill for
-                // several — instead of the squished vertical oval a fixed 6.5 radius
-                // on an 11×13 box produced.
                 let padX: CGFloat = 3
                 let capH: CGFloat = 12
-                let cap = NSRect(x: x - padX, y: cy - capH / 2, width: gw + padX * 2, height: capH)
-                let capPath = NSBezierPath(roundedRect: cap, xRadius: capH / 2, yRadius: capH / 2)
+                // "Running" glows the WHOLE session capsule in sync and ENLARGES it on
+                // a ~1s beat, so a multi-model session's adjacent dots share ONE
+                // coherent glow instead of per-dot rings that collide when the points
+                // sit next to each other. The capsule is a circle for a single model
+                // (padX makes width == height), a horizontal pill for several. The
+                // dots inside keep their constant provider colours.
+                let g = group.busy ? CGFloat((sin(Double(phase) * .pi / 5 + Double(gi)) + 1) * 0.5) : 0
+                let grow = 2.0 * g
+                let cap = NSRect(x: x - padX - grow, y: cy - capH / 2 - grow,
+                                 width: gw + padX * 2 + grow * 2, height: capH + grow * 2)
+                let capPath = NSBezierPath(roundedRect: cap, xRadius: cap.height / 2, yRadius: cap.height / 2)
                 NSColor.black.withAlphaComponent(0.4).setFill()
                 capPath.fill()
-                NSColor.white.withAlphaComponent(0.35).setStroke()
-                capPath.lineWidth = 0.75
-                capPath.stroke()
+                if group.busy {
+                    // Glow in the session's blended colour (its own colour for one
+                    // model), so the group reads as a single running unit.
+                    let glowColor: NSColor = {
+                        let rgb = group.colors.compactMap { $0.usingColorSpace(.sRGB) }
+                        guard let first = rgb.first else { return .white }
+                        if rgb.count == 1 { return first }
+                        let n = CGFloat(rgb.count)
+                        return NSColor(srgbRed: rgb.map { $0.redComponent }.reduce(0, +) / n,
+                                       green: rgb.map { $0.greenComponent }.reduce(0, +) / n,
+                                       blue: rgb.map { $0.blueComponent }.reduce(0, +) / n, alpha: 1)
+                    }()
+                    NSGraphicsContext.saveGraphicsState()
+                    let shadow = NSShadow()
+                    shadow.shadowColor = glowColor.withAlphaComponent(0.9)
+                    shadow.shadowBlurRadius = 2.0 + 4.0 * g
+                    shadow.shadowOffset = .zero
+                    shadow.set()
+                    glowColor.withAlphaComponent(0.5 + 0.4 * g).setStroke()
+                    capPath.lineWidth = 1.4
+                    capPath.stroke()
+                    NSGraphicsContext.restoreGraphicsState()
+                } else {
+                    NSColor.white.withAlphaComponent(0.35).setStroke()
+                    capPath.lineWidth = 0.75
+                    capPath.stroke()
+                }
 
-                // "Running" is shown by a GLOWING BORDER that ENLARGES on a ~1s beat
-                // — the dot's colour and size never change, so it always reads as its
-                // provider; only the pulsing glow ring around it says "working".
-                for (ci, color) in group.colors.enumerated() {
+                // Dots on top — crisp, constant provider colour, fixed size.
+                for color in group.colors {
                     let cx = x + dotSize / 2
                     let dotRect = NSRect(x: cx - dotSize / 2, y: cy - dotSize / 2, width: dotSize, height: dotSize)
-                    if group.busy {
-                        let g = CGFloat((sin(Double(phase) * .pi / 5 + Double(gi) + Double(ci) * 0.6) + 1) * 0.5)
-                        let r = dotSize / 2 + 0.75 + 2.0 * g          // the border enlarges with the beat
-                        let ring = NSBezierPath(ovalIn: NSRect(x: cx - r, y: cy - r, width: r * 2, height: r * 2))
-                        NSGraphicsContext.saveGraphicsState()
-                        let shadow = NSShadow()
-                        shadow.shadowColor = color.withAlphaComponent(0.9)   // glow in the dot's own colour
-                        shadow.shadowBlurRadius = 1.5 + 3.0 * g
-                        shadow.shadowOffset = .zero
-                        shadow.set()
-                        color.withAlphaComponent(0.4 + 0.5 * g).setStroke()
-                        ring.lineWidth = 1.3
-                        ring.stroke()
-                        NSGraphicsContext.restoreGraphicsState()
-                    }
-                    color.setFill()                                   // constant, solid provider colour
+                    color.setFill()
                     NSBezierPath(ovalIn: dotRect).fill()
                     let dot = NSBezierPath(ovalIn: dotRect)
                     NSColor.white.withAlphaComponent(0.85).setStroke()
