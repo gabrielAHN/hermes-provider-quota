@@ -1291,10 +1291,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Per-source header: the source's identity (name + connected/disconnected) on
     // the left, and a compact right-aligned cluster of that source's OWN controls
-    // — its pet (paw toggles on/off, thumbnail cycles) plus, for Hermes, its
-    // gateway Login/Logout and Setup. One header per enabled source, so a source's
-    // controls sit right where its connection state shows. Kept tight with small
-    // icon buttons so the section stays concise.
+    // — its pet (paw toggles on/off, thumbnail cycles) plus, for Hermes, a shortcut
+    // that opens the Hermes app (login/logout/settings are controlled in Hermes, not
+    // here). One header per enabled source, so a source's controls sit right where
+    // its connection state shows. Kept tight with small icon buttons.
     private func sourceHeaderView(_ source: SourceQuota) -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 28))
         let kind = source.kind
@@ -1311,7 +1311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Right-aligned cluster of this source's own controls — plain, uniform icon
         // buttons: a per-SOURCE Refresh, the pet (paw toggle + its picture to
-        // switch), then — Hermes only — login/logout and setup.
+        // switch), then — Hermes only — a shortcut that opens the Hermes app.
         let key = kind.rawValue
         let on = PetCatalog.petEnabled(forKey: key)
         let pet = PetCatalog.selected(forKey: key)
@@ -1331,18 +1331,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if kind == .hermes {
-            if source.connected {
-                controls.append(iconButton(image: NSImage(systemSymbolName: "rectangle.portrait.and.arrow.right", accessibilityDescription: nil),
-                                           tint: .hermesRed, action: #selector(signOutGateway), key: nil,
-                                           tooltip: "Log out of the Hermes gateway"))
-            } else {
-                controls.append(iconButton(image: NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil),
-                                           tint: .hermesGreen, action: #selector(signInGateway), key: nil,
-                                           tooltip: "Log in to the Hermes gateway"))
-            }
-            controls.append(iconButton(image: NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil),
-                                       tint: .hermesBlue, action: #selector(openGatewaySetup), key: nil,
-                                       tooltip: "Set up the Hermes gateway"))
+            // The menu does NOT control the gateway's login / logout / settings —
+            // those live in Hermes itself. So instead of sign-in/out + setup
+            // buttons, offer a single Hermes icon that just opens the Hermes app.
+            let appURL = gatewayAppURL()
+            let hermesIcon = appURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
+                ?? NSImage(systemSymbolName: "arrow.up.forward.app", accessibilityDescription: nil)
+            hermesIcon?.size = NSSize(width: 20, height: 20)
+            controls.append(iconButton(image: hermesIcon, tint: appURL == nil ? .hermesBlue : nil,
+                                       action: #selector(openHermes), key: nil,
+                                       tooltip: "Open Hermes"))
         }
 
         // Rightmost slot: the per-SOURCE Refresh (re-checks this whole source) —
@@ -1542,22 +1540,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Draws a provider status dot into the current context: the dot in the
-    // provider's own colour, and — when it's OFFLINE or OUT OF QUOTA — a bold red
-    // ring drawn OUTSIDE it (with a clear gap) so the alert reads at a glance.
-    private func drawProviderDot(in rect: NSRect, color: NSColor, bad: Bool, active: Bool = false) {
+    // provider's own colour, an optional GLOW (in that colour) while it's running a
+    // session right now, and an optional alert RING drawn OUTSIDE it (with a clear
+    // gap): YELLOW when it's out of quota, RED when the source isn't connected — so
+    // the two problems read differently at a glance.
+    private func drawProviderDot(in rect: NSRect, color: NSColor, ringColor: NSColor?, active: Bool = false) {
         let s = rect.width
-        let fillInset = bad ? s * 0.26 : s * 0.12
+        let fillInset = ringColor != nil ? s * 0.26 : s * 0.12
         let dotRect = rect.insetBy(dx: fillInset, dy: fillInset)
         // A provider running a session RIGHT NOW glows its menu-bar dot in its own
-        // colour (matches the pet's session glow).
+        // colour — as prominent as the pet's per-point session glow.
         if active {
             // Soft colour wash so the glow reads clearly IN the provider's colour.
             color.withAlphaComponent(0.22).setFill()
-            NSBezierPath(ovalIn: dotRect.insetBy(dx: -3.5, dy: -3.5)).fill()
+            NSBezierPath(ovalIn: dotRect.insetBy(dx: -4, dy: -4)).fill()
             NSGraphicsContext.current?.saveGraphicsState()
             let shadow = NSShadow()
             shadow.shadowColor = color.withAlphaComponent(0.95)
-            shadow.shadowBlurRadius = 3.6
+            shadow.shadowBlurRadius = 4.2
             shadow.shadowOffset = .zero
             shadow.set()
             color.setFill()
@@ -1565,35 +1565,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSBezierPath(ovalIn: dotRect).fill()   // second pass strengthens the glow
             NSGraphicsContext.current?.restoreGraphicsState()
         }
-        let fill = NSBezierPath(ovalIn: dotRect)
         color.setFill()
-        fill.fill()
-        if bad {
+        NSBezierPath(ovalIn: dotRect).fill()
+        // Thin white outline hugging the dot — the SAME point style as the pet's
+        // session points, so the header dots read as the same object.
+        let outline = NSBezierPath(ovalIn: dotRect)
+        NSColor.white.withAlphaComponent(0.85).setStroke()
+        outline.lineWidth = max(0.75, s * 0.09)
+        outline.stroke()
+        if let ringColor {
             let ring = NSBezierPath(ovalIn: rect.insetBy(dx: s * 0.1, dy: s * 0.1))
-            NSColor.hermesRed.setStroke()
+            ringColor.setStroke()
             ring.lineWidth = max(2, s * 0.16)
             ring.stroke()
         }
     }
 
-    // The red alert ring is ONLY for offline (source down) or out-of-quota — a
+    // The alert ring: RED when the source isn't connected (needs sign-in), YELLOW
+    // when connected but out of quota (needs a reset / top-up), nil when fine. A
     // provider that's connected but momentarily can't read its usage (e.g. a 429)
-    // is not an "issue", so it keeps its normal coloured dot.
-    private func providerAlarming(_ provider: QuotaProvider, connected: Bool) -> Bool {
-        let offline = !connected
-        let exhausted = provider.status == "ok" && providerIsExhausted(provider)
-        return offline || exhausted
+    // is not an "issue", so it keeps its plain coloured dot.
+    private func providerRingColor(_ provider: QuotaProvider, connected: Bool) -> NSColor? {
+        if !connected { return .hermesRed }
+        if providerIsExhausted(provider) { return .hermesYellow }
+        return nil
     }
 
     private func providerDotImage(_ provider: QuotaProvider, size: CGFloat, connected: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
-        let bad = providerAlarming(provider, connected: connected)
+        let ring = providerRingColor(provider, connected: connected)
         drawProviderDot(in: NSRect(x: 0, y: 0, width: size, height: size),
-                        color: providerBrandColor(provider), bad: bad)
+                        color: providerBrandColor(provider), ringColor: ring)
         image.unlockFocus()
         image.isTemplate = false
-        image.accessibilityDescription = !connected ? "\(provider.label) is not connected" : bad ? "\(provider.label) has no quota" : "\(provider.label) is active"
+        image.accessibilityDescription = !connected ? "\(provider.label) is not connected — sign in" : ring != nil ? "\(provider.label) is out of quota" : "\(provider.label) is active"
         return image
     }
 
@@ -1620,21 +1626,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerSummary(_ provider: QuotaProvider, connected: Bool) -> String {
         // Per-provider status when the source is down, rather than repeating the
         // whole connection summary on every row.
-        guard connected else { return "Disconnected" }
+        // Not connected (red ring) → say what to do: sign in.
+        guard connected else { return "Disconnected · sign in" }
         guard provider.status == "ok" else {
             return provider.status.replacingOccurrences(of: "_", with: " ").capitalized
         }
         let reached = provider.windows.filter(\.limitReached)
         if !reached.isEmpty {
-            let labels = reached.map(\.label).joined(separator: " + ")
-            let base = "\(labels) limit\(reached.count == 1 ? "" : "s") reached"
-            // Show WHEN it frees up — the soonest reset among the reached windows.
+            // Out of quota (yellow ring). Reset FIRST (so it never gets truncated off
+            // the row) — that reset time IS the thing to wait for. When there's no
+            // reset, credit-based providers just need a top-up, so say so.
             if let soonest = reached.compactMap({ parsedDate($0.resetsAt) }).filter({ $0 > Date() }).min() {
                 let formatter = RelativeDateTimeFormatter()
                 formatter.unitsStyle = .short
-                return "\(base) · resets \(formatter.localizedString(for: soonest, relativeTo: Date()))"
+                return "Resets \(formatter.localizedString(for: soonest, relativeTo: Date())) · over limit"
             }
-            return base
+            if ["openrouter", "opencode"].contains(Self.normalizedProvider(provider.provider)) {
+                return "Over limit · add credits"
+            }
+            return "Over limit"
         }
         // OpenRouter-shaped rows (the env/~/.hermes key AND opencode's own key)
         // carry a single "Account credits" window — summarise it as an amount.
@@ -1704,7 +1714,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for provider in section.providers {
                 drawProviderDot(in: NSRect(x: x, y: dotY, width: 11, height: 11),
                                 color: providerBrandColor(provider.provider),
-                                bad: providerAlarming(provider, connected: section.connected),
+                                ringColor: providerRingColor(provider, connected: section.connected),
                                 active: providerActive(section.kind, provider.provider))
                 x += step
             }
