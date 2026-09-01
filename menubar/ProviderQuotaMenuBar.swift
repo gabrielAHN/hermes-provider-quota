@@ -300,6 +300,10 @@ struct PetTile: Equatable {
     // Which source this pet belongs to (GatewayKind rawValue), so a right-click
     // "Turn Off" can disable the right source's pet. Empty for placeholders.
     var sourceKey: String = ""
+    // Provider colours (lowercased hex) in this source that are OUT OF QUOTA /
+    // disconnected — a session point in one of these gets the red alert ring,
+    // matching the header/menu dots.
+    var alertHexes: Set<String> = []
 }
 
 enum PetCatalog {
@@ -758,14 +762,17 @@ final class ActivityPetsView: NSView {
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
             let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
-            var groups: [(colors: [NSColor], busy: Bool)] = []
+            var groups: [(colors: [(NSColor, String)], busy: Bool)] = []
             var total = 0
             for mark in tile.sessions {
-                var colors = mark.hex.split(separator: ",").compactMap { NSColor(activityHex: String($0)) }
-                if colors.isEmpty { colors = [.hermesBlue] }
-                if !groups.isEmpty && total + colors.count > 7 { break }
-                groups.append((colors, mark.busy))
-                total += colors.count
+                var pairs = mark.hex.split(separator: ",").compactMap { part -> (NSColor, String)? in
+                    let h = String(part).lowercased()
+                    return NSColor(activityHex: h).map { ($0, h) }
+                }
+                if pairs.isEmpty { pairs = [(.hermesBlue, "")] }
+                if !groups.isEmpty && total + pairs.count > 7 { break }
+                groups.append((pairs, mark.busy))
+                total += pairs.count
                 if total >= 7 { break }
             }
             func groupW(_ count: Int) -> CGFloat { CGFloat(count) * dotSize + CGFloat(max(0, count - 1)) * innerGap }
@@ -801,8 +808,21 @@ final class ActivityPetsView: NSView {
                 // that pulses + enlarges on the beat — one glowing dot for a single model,
                 // two adjacent glowing dots (each its colour) for a multi-model session.
                 var dx = cx0 + padX
-                for color in group.colors {
+                for (color, hex) in group.colors {
                     let dotRect = NSRect(x: dx, y: cy - dotSize / 2, width: dotSize, height: dotSize)
+                    if tile.alertHexes.contains(hex) {
+                        // OUT OF QUOTA / disconnected: a red "buffer" ring around a
+                        // smaller dot — the SAME alert as the header/menu dots (no
+                        // white outline, no glow).
+                        color.setFill()
+                        NSBezierPath(ovalIn: dotRect.insetBy(dx: 0.75, dy: 0.75)).fill()
+                        let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1))
+                        NSColor.hermesRed.setStroke()
+                        ring.lineWidth = 1.4
+                        ring.stroke()
+                        dx += dotSize + innerGap
+                        continue
+                    }
                     if group.busy {
                         color.withAlphaComponent(0.22).setFill()
                         NSBezierPath(ovalIn: dotRect.insetBy(dx: -2.5 - g, dy: -2.5 - g)).fill()
@@ -1544,7 +1564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // session right now, and — when it's out of quota or not connected — a single
     // RED "buffer" ring outside it (replacing the healthy dot's white outline), so
     // the problem reads at a glance.
-    private func drawProviderDot(in rect: NSRect, color: NSColor, ringColor: NSColor?, active: Bool = false) {
+    private func drawProviderDot(in rect: NSRect, color: NSColor, ringColor: NSColor?, active: Bool = false, whiteOutline: Bool = true) {
         let s = rect.width
         let fillInset = ringColor != nil ? s * 0.26 : s * 0.12
         let dotRect = rect.insetBy(dx: fillInset, dy: fillInset)
@@ -1574,8 +1594,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ringColor.setStroke()
             ring.lineWidth = max(2, s * 0.16)
             ring.stroke()
-        } else {
+        } else if whiteOutline {
             // Healthy: a thin white outline hugging the dot — the pet's point style.
+            // Skipped in the dropdown menu (plain dots there).
             let outline = NSBezierPath(ovalIn: dotRect)
             NSColor.white.withAlphaComponent(0.85).setStroke()
             outline.lineWidth = max(0.75, s * 0.09)
@@ -1596,8 +1617,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
         let ring = providerRingColor(provider, connected: connected)
+        // Dropdown dots are plain (no white outline / no glow) — only the red alert
+        // ring shows here; the pet-style outline+glow lives on the header + pets.
         drawProviderDot(in: NSRect(x: 0, y: 0, width: size, height: size),
-                        color: providerBrandColor(provider), ringColor: ring)
+                        color: providerBrandColor(provider), ringColor: ring, whiteOutline: false)
         image.unlockFocus()
         image.isTemplate = false
         image.accessibilityDescription = !connected ? "\(provider.label) is not connected — sign in" : ring != nil ? "\(provider.label) is out of quota" : "\(provider.label) is active"
@@ -2375,12 +2398,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 working = !marks.isEmpty
             }
 
+            // Provider colours that are out of quota (or disconnected) — a session
+            // point in one of these gets the red alert ring, matching the header.
+            let alertHexes = Set((sources.first { $0.kind == kind }?.providers ?? [])
+                .filter { providerRingColor($0, connected: connected) != nil }
+                .map { Self.providerHex($0.provider).lowercased() })
+
             // The pet moves while the source is working; otherwise it sits idle.
             // Dots only appear for genuinely running sessions.
             let display = working
                 ? Self.workingSourceInstance(name: sourceName(kind), title: title)
                 : Self.idleSourceInstance(name: sourceName(kind))
-            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue))
+            tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue, alertHexes: alertHexes))
         }
         return tiles
     }
