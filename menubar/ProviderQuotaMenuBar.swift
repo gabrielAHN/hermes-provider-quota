@@ -128,7 +128,7 @@ extension NSColor {
     static let hermesGreen = NSColor(activityHex: "1f8a65")!       // --ui-green (connected / healthy)
     static let hermesOrange = NSColor(activityHex: "db704b")!      // --ui-orange (low / waiting)
     static let hermesRed = NSColor(activityHex: "cf2d56")!         // --ui-red (disconnected / error)
-    static let hermesYellow = NSColor(activityHex: "c08532")!      // --ui-yellow (exhausted)
+    static let hermesYellow = NSColor(activityHex: "ffcc00")!      // bright yellow (exhausted / no-quota ring — vivid so it reads at a glance)
 }
 
 final class HoverGlowButton: NSButton {
