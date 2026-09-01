@@ -462,6 +462,44 @@ def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -
     return recent
 
 
+# A webchat bot (helper-chat server.py, :8090) drives `hermes -p <profile> acp`,
+# whose turns log to STDERR (discarded by the server), so they NEVER reach
+# agent.log or the registry — the log/lease paths above can't see them. Read the
+# webchat's own /api/running for its live bot sessions. Best-effort: a no-op if the
+# service isn't present. Provider follows the same bot→provider map the webchat uses.
+_WEBCHAT_URL = "http://127.0.0.1:8090/api/running"
+_WEBCHAT_KEY_FILE = Path.home() / ".hermes" / "helper-chat" / ".key"
+_BOT_PROVIDER = {"helper": "openrouter", "carto": "copilot-acp", "default": "anthropic"}
+
+
+def _webchat_bot_sessions() -> list[dict[str, Any]]:
+    try:
+        key = _WEBCHAT_KEY_FILE.read_text(encoding="utf-8").strip()
+        if not key:
+            return []
+        req = urllib.request.Request(_WEBCHAT_URL, headers={"X-Helper-Key": key})
+        with urllib.request.urlopen(req, timeout=1.5) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for s in data.get("sessions") or []:
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        provider = _BOT_PROVIDER.get(str(s.get("profile") or s.get("bot") or "default"), "anthropic")
+        out.append({
+            "session_id": sid,
+            "surface": "webchat",
+            "started_at": None,
+            "model": "",
+            "provider": provider,   # bot→provider; the client colours by this
+            "models": [],
+            "is_active": True,
+        })
+    return out
+
+
 @router.get("/activity")
 def activity() -> dict[str, Any]:
     now = time.time()
@@ -496,6 +534,12 @@ def activity() -> dict[str, Any]:
             "models": [m for m, _ in pairs],   # every distinct model this session ran
             "is_active": True,
         })
+    # Merge webchat bot sessions (ACP turns that never hit agent.log), deduped.
+    seen = {o["session_id"] for o in out}
+    for s in _webchat_bot_sessions():
+        if s["session_id"] not in seen:
+            out.append(s)
+            seen.add(s["session_id"])
     return {"broker": socket.gethostname(), "sessions": out}
 
 
