@@ -312,6 +312,24 @@ def _tail_text(path: Path, max_bytes: int = 262144) -> str:
         return ""
 
 
+def _log_dirs(home: Path) -> list[Path]:
+    # The default profile logs to ~/.hermes/logs; each named profile (e.g. a
+    # channel/ACP BOT running under `helper`) has its own ~/.hermes/profiles/<p>/logs.
+    dirs = [home / "logs"]
+    try:
+        dirs += sorted((home / "profiles").glob("*/logs"))
+    except Exception:
+        pass
+    return [d for d in dirs if d.is_dir()]
+
+
+def _read_log(home: Path, name: str) -> str:
+    # Tail `<name>` from the root AND every profile's log dir, so a session running
+    # under ANY profile is seen — not just the default profile's root logs. The
+    # per-line age filters downstream drop stale profiles' old lines.
+    return "\n".join(_tail_text(d / name) for d in _log_dirs(home))
+
+
 def _log_ts(line: str) -> float | None:
     m = _RE_LOG_TS.match(line)
     if not m:
@@ -326,7 +344,7 @@ def _log_ts(line: str) -> float | None:
 
 def _active_tui_sessions(home: Path, now: float) -> dict[str, dict[str, Any]]:
     state: dict[str, tuple[float, str]] = {}
-    for line in _tail_text(home / "logs" / "gui.log").splitlines():
+    for line in _read_log(home, "gui.log").splitlines():
         ts = _log_ts(line)
         if ts is None or now - ts > _ACTIVITY_MAX_AGE:
             continue
@@ -354,13 +372,20 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
     # means a finished turn never lingers).
     start: dict[str, float] = {}
     end: dict[str, float] = {}
-    for line in _tail_text(home / "logs" / "agent.log").splitlines():
+    subagent: set[str] = set()
+    for line in _read_log(home, "agent.log").splitlines():
         ts = _log_ts(line)
         if ts is None or now - ts > _ACTIVITY_MAX_AGE:
             continue
         m = _RE_TURN_START.search(line)
         if m:
             start[m.group(1)] = ts
+            # A delegated subagent runs under its OWN session id but is part of the
+            # PARENT session's work (`platform=subagent`). Don't surface it as a
+            # separate session — it's counted within the parent, which stays shown
+            # while it orchestrates the subagent.
+            if "platform=subagent" in line:
+                subagent.add(m.group(1))
             continue
         m = _RE_TURN_END.search(line)
         if m:
@@ -368,7 +393,7 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
     return {
         sid: {"started_at": ts, "surface": "agent"}
         for sid, ts in start.items()
-        if ts > end.get(sid, 0.0)
+        if ts > end.get(sid, 0.0) and sid not in subagent
     }
 
 
@@ -401,7 +426,7 @@ def _models_for(home: Path, sids: set[str]) -> dict[str, list[tuple[str, str]]]:
     if not sids:
         return {}
     out: dict[str, list[tuple[str, str]]] = {}
-    for line in _tail_text(home / "logs" / "agent.log").splitlines():
+    for line in _read_log(home, "agent.log").splitlines():
         m = _RE_MODEL.search(line)
         if m and m.group(1) in sids:
             pair = (m.group(2), m.group(3))
@@ -425,7 +450,7 @@ def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -
         return set()
     recent: set[str] = set()
     for name in ("agent.log", "gui.log"):
-        for line in _tail_text(home / "logs" / name).splitlines():
+        for line in _read_log(home, name).splitlines():
             ts = _log_ts(line)
             if ts is None or now - ts > window:
                 continue
@@ -435,6 +460,44 @@ def _recent_session_ids(home: Path, sids: set[str], window: float, now: float) -
         if recent == sids:
             break
     return recent
+
+
+# A webchat bot (helper-chat server.py, :8090) drives `hermes -p <profile> acp`,
+# whose turns log to STDERR (discarded by the server), so they NEVER reach
+# agent.log or the registry — the log/lease paths above can't see them. Read the
+# webchat's own /api/running for its live bot sessions. Best-effort: a no-op if the
+# service isn't present. Provider follows the same bot→provider map the webchat uses.
+_WEBCHAT_URL = "http://127.0.0.1:8090/api/running"
+_WEBCHAT_KEY_FILE = Path.home() / ".hermes" / "helper-chat" / ".key"
+_BOT_PROVIDER = {"helper": "openrouter", "carto": "copilot-acp", "default": "anthropic"}
+
+
+def _webchat_bot_sessions() -> list[dict[str, Any]]:
+    try:
+        key = _WEBCHAT_KEY_FILE.read_text(encoding="utf-8").strip()
+        if not key:
+            return []
+        req = urllib.request.Request(_WEBCHAT_URL, headers={"X-Helper-Key": key})
+        with urllib.request.urlopen(req, timeout=1.5) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for s in data.get("sessions") or []:
+        sid = str(s.get("id") or "").strip()
+        if not sid:
+            continue
+        provider = _BOT_PROVIDER.get(str(s.get("profile") or s.get("bot") or "default"), "anthropic")
+        out.append({
+            "session_id": sid,
+            "surface": "webchat",
+            "started_at": None,
+            "model": "",
+            "provider": provider,   # bot→provider; the client colours by this
+            "models": [],
+            "is_active": True,
+        })
+    return out
 
 
 @router.get("/activity")
@@ -471,6 +534,12 @@ def activity() -> dict[str, Any]:
             "models": [m for m, _ in pairs],   # every distinct model this session ran
             "is_active": True,
         })
+    # Merge webchat bot sessions (ACP turns that never hit agent.log), deduped.
+    seen = {o["session_id"] for o in out}
+    for s in _webchat_bot_sessions():
+        if s["session_id"] not in seen:
+            out.append(s)
+            seen.add(s["session_id"])
     return {"broker": socket.gethostname(), "sessions": out}
 
 
