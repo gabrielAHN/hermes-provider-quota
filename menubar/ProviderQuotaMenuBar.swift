@@ -128,7 +128,7 @@ extension NSColor {
     static let hermesGreen = NSColor(activityHex: "1f8a65")!       // --ui-green (connected / healthy)
     static let hermesOrange = NSColor(activityHex: "db704b")!      // --ui-orange (low / waiting)
     static let hermesRed = NSColor(activityHex: "cf2d56")!         // --ui-red (disconnected / error)
-    static let hermesYellow = NSColor(activityHex: "c08532")!      // --ui-yellow (exhausted)
+    static let hermesYellow = NSColor(activityHex: "c08532")!      // --ui-yellow (warning)
 }
 
 final class HoverGlowButton: NSButton {
@@ -1541,9 +1541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Draws a provider status dot into the current context: the dot in the
     // provider's own colour, an optional GLOW (in that colour) while it's running a
-    // session right now, and an optional alert RING drawn OUTSIDE it (with a clear
-    // gap): YELLOW when it's out of quota, RED when the source isn't connected — so
-    // the two problems read differently at a glance.
+    // session right now, and — when it's out of quota or not connected — a RED
+    // alert: the dot's outline turns from white to red AND a red ring is drawn
+    // OUTSIDE it (with a clear gap), so the problem reads at a glance.
     private func drawProviderDot(in rect: NSRect, color: NSColor, ringColor: NSColor?, active: Bool = false) {
         let s = rect.width
         let fillInset = ringColor != nil ? s * 0.26 : s * 0.12
@@ -1567,10 +1567,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         color.setFill()
         NSBezierPath(ovalIn: dotRect).fill()
-        // Thin white outline hugging the dot — the SAME point style as the pet's
-        // session points, so the header dots read as the same object.
+        // Thin outline hugging the dot — the SAME point style as the pet's session
+        // points (white by default), but it turns RED on an alert (out of quota /
+        // not connected) so the whole dot reads as a problem.
         let outline = NSBezierPath(ovalIn: dotRect)
-        NSColor.white.withAlphaComponent(0.85).setStroke()
+        (ringColor ?? NSColor.white.withAlphaComponent(0.85)).setStroke()
         outline.lineWidth = max(0.75, s * 0.09)
         outline.stroke()
         if let ringColor {
@@ -1581,13 +1582,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // The alert ring: RED when the source isn't connected (needs sign-in), YELLOW
-    // when connected but out of quota (needs a reset / top-up), nil when fine. A
+    // The RED alert colour for a provider that's out of quota OR not connected —
+    // used for BOTH the dot's outline and the outer ring; nil when it's fine. A
     // provider that's connected but momentarily can't read its usage (e.g. a 429)
-    // is not an "issue", so it keeps its plain coloured dot.
+    // is not an "issue", so it keeps its plain white-outlined dot.
     private func providerRingColor(_ provider: QuotaProvider, connected: Bool) -> NSColor? {
-        if !connected { return .hermesRed }
-        if providerIsExhausted(provider) { return .hermesYellow }
+        if !connected || providerIsExhausted(provider) { return .hermesRed }
         return nil
     }
 
