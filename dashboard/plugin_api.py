@@ -472,28 +472,38 @@ _WEBCHAT_KEY_FILE = Path.home() / ".hermes" / "helper-chat" / ".key"
 _BOT_PROVIDER = {"helper": "openrouter", "carto": "copilot-acp", "default": "anthropic"}
 
 
+_webchat_seen: dict[str, dict[str, Any]] = {}   # sid -> {"t": last_seen, "provider": …}
+_WEBCHAT_HOLD = 8.0   # keep a bot dot lit briefly after its (often quick) turn ends
+
+
 def _webchat_bot_sessions() -> list[dict[str, Any]]:
+    now = time.time()
     try:
         key = _WEBCHAT_KEY_FILE.read_text(encoding="utf-8").strip()
-        if not key:
-            return []
-        req = urllib.request.Request(_WEBCHAT_URL, headers={"X-Helper-Key": key})
-        with urllib.request.urlopen(req, timeout=1.5) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
+        if key:
+            req = urllib.request.Request(_WEBCHAT_URL, headers={"X-Helper-Key": key})
+            with urllib.request.urlopen(req, timeout=1.5) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            for s in data.get("sessions") or []:
+                sid = str(s.get("id") or "").strip()
+                if sid:
+                    prov = _BOT_PROVIDER.get(str(s.get("profile") or s.get("bot") or "default"), "anthropic")
+                    _webchat_seen[sid] = {"t": now, "provider": prov}
     except Exception:
-        return []
+        pass
+    # A short HOLD so a brief (fast GLM) turn stays visible a few seconds after it
+    # clears from /api/running, instead of flashing by unnoticed.
     out: list[dict[str, Any]] = []
-    for s in data.get("sessions") or []:
-        sid = str(s.get("id") or "").strip()
-        if not sid:
+    for sid, info in list(_webchat_seen.items()):
+        if now - info["t"] > _WEBCHAT_HOLD:
+            del _webchat_seen[sid]
             continue
-        provider = _BOT_PROVIDER.get(str(s.get("profile") or s.get("bot") or "default"), "anthropic")
         out.append({
             "session_id": sid,
             "surface": "webchat",
             "started_at": None,
             "model": "",
-            "provider": provider,   # bot→provider; the client colours by this
+            "provider": info["provider"],   # bot→provider; the client colours by this
             "models": [],
             "is_active": True,
         })
