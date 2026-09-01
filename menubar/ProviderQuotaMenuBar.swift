@@ -1541,9 +1541,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Draws a provider status dot into the current context: the dot in the
     // provider's own colour, an optional GLOW (in that colour) while it's running a
-    // session right now, and — when it's out of quota or not connected — a RED
-    // alert: the dot's outline turns from white to red AND a red ring is drawn
-    // OUTSIDE it (with a clear gap), so the problem reads at a glance.
+    // session right now, and — when it's out of quota or not connected — a single
+    // RED "buffer" ring outside it (replacing the healthy dot's white outline), so
+    // the problem reads at a glance.
     private func drawProviderDot(in rect: NSRect, color: NSColor, ringColor: NSColor?, active: Bool = false) {
         let s = rect.width
         let fillInset = ringColor != nil ? s * 0.26 : s * 0.12
@@ -1567,18 +1567,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         color.setFill()
         NSBezierPath(ovalIn: dotRect).fill()
-        // Thin outline hugging the dot — the SAME point style as the pet's session
-        // points (white by default), but it turns RED on an alert (out of quota /
-        // not connected) so the whole dot reads as a problem.
-        let outline = NSBezierPath(ovalIn: dotRect)
-        (ringColor ?? NSColor.white.withAlphaComponent(0.85)).setStroke()
-        outline.lineWidth = max(0.75, s * 0.09)
-        outline.stroke()
         if let ringColor {
+            // Alert (out of quota / not connected): a SINGLE red "buffer" ring
+            // outside the dot — one clean line, no extra hugging outline.
             let ring = NSBezierPath(ovalIn: rect.insetBy(dx: s * 0.1, dy: s * 0.1))
             ringColor.setStroke()
             ring.lineWidth = max(2, s * 0.16)
             ring.stroke()
+        } else {
+            // Healthy: a thin white outline hugging the dot — the pet's point style.
+            let outline = NSBezierPath(ovalIn: dotRect)
+            NSColor.white.withAlphaComponent(0.85).setStroke()
+            outline.lineWidth = max(0.75, s * 0.09)
+            outline.stroke()
         }
     }
 
