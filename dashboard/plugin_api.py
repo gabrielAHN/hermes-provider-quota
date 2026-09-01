@@ -372,6 +372,7 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
     # means a finished turn never lingers).
     start: dict[str, float] = {}
     end: dict[str, float] = {}
+    subagent: set[str] = set()
     for line in _read_log(home, "agent.log").splitlines():
         ts = _log_ts(line)
         if ts is None or now - ts > _ACTIVITY_MAX_AGE:
@@ -379,6 +380,12 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
         m = _RE_TURN_START.search(line)
         if m:
             start[m.group(1)] = ts
+            # A delegated subagent runs under its OWN session id but is part of the
+            # PARENT session's work (`platform=subagent`). Don't surface it as a
+            # separate session — it's counted within the parent, which stays shown
+            # while it orchestrates the subagent.
+            if "platform=subagent" in line:
+                subagent.add(m.group(1))
             continue
         m = _RE_TURN_END.search(line)
         if m:
@@ -386,7 +393,7 @@ def _active_agent_turns(home: Path, now: float) -> dict[str, dict[str, Any]]:
     return {
         sid: {"started_at": ts, "surface": "agent"}
         for sid, ts in start.items()
-        if ts > end.get(sid, 0.0)
+        if ts > end.get(sid, 0.0) and sid not in subagent
     }
 
 
