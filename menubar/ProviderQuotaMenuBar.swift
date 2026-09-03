@@ -1894,10 +1894,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return button
     }
 
-    // The sources are configured by the user: two enable chips — Hermes (the
-    // gateway) and Local (locally-authenticated providers) — both OFF by default.
-    // Enable one or BOTH; when both are on, both sources' providers are shown
-    // together. No fallback. Disabling a chip drops that source's providers.
+    // The sources are configured by the user via a multi-select dropdown — Hermes
+    // (the gateway) and Local (locally-authenticated providers), both OFF by
+    // default. Enable one or BOTH (checkmarks); when both are on, both sources'
+    // providers are shown together. No fallback. Deselecting drops that source's
+    // providers.
     private func gatewayRowView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
         let enabled = enabledGateways()
@@ -1909,19 +1910,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(label("Sources", frame: NSRect(x: 42, y: 12, width: 150, height: 16),
                               font: .systemFont(ofSize: 12, weight: .medium)))
 
-        // Per-source enable chips (independent on/off; enable both to see both).
-        for (kind, cx) in [(GatewayKind.hermes, CGFloat(210)), (GatewayKind.local, CGFloat(278))] {
-            let name = sourceName(kind)
-            let on = gatewayEnabled(kind)
+        // Multi-select dropdown: a pull-down with a checkmark per source, so you can
+        // activate one or both. The button title summarises what's active; picking
+        // an item toggles that source.
+        let order: [GatewayKind] = [.hermes, .local]
+        let active = order.filter { gatewayEnabled($0) }
+        let summary = active.isEmpty ? "Select…" : active.map { sourceName($0) }.joined(separator: ", ")
+        let popup = NSPopUpButton(frame: NSRect(x: 206, y: 9, width: 138, height: 22), pullsDown: true)
+        popup.controlSize = .small
+        popup.font = .systemFont(ofSize: 11, weight: .medium)
+        let sourcesMenu = NSMenu()
+        sourcesMenu.addItem(withTitle: summary, action: nil, keyEquivalent: "")   // pull-down title (index 0)
+        for kind in order {
+            let item = NSMenuItem(title: sourceName(kind), action: #selector(toggleGatewayFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = gatewayEnabled(kind) ? .on : .off
+            item.representedObject = kind.rawValue
             let connected = sources.first { $0.kind == kind }?.connected ?? false
-            let glow: NSColor = !on ? .disabledControlTextColor : (connected ? .hermesGreen : .hermesRed)
-            let chip = textActionButton(name, action: #selector(toggleGatewayEnabled(_:)), glowColor: glow)
-            chip.frame = NSRect(x: cx, y: 7, width: 64, height: 26)
-            chip.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
-            chip.alphaValue = on ? 1.0 : 0.55
-            chip.toolTip = on ? "Disable \(name) (removes its providers)" : "Enable \(name)"
-            view.addSubview(chip)
+            item.toolTip = gatewayEnabled(kind)
+                ? "\(sourceName(kind)) — \(connected ? "connected" : "disconnected"). Select to disable."
+                : "Select to enable \(sourceName(kind))"
+            sourcesMenu.addItem(item)
         }
+        popup.menu = sourcesMenu
+        view.addSubview(popup)
         return view
     }
 
@@ -2289,6 +2301,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Enable / disable a single source. sender.identifier is the kind's rawValue.
     @objc private func toggleGatewayEnabled(_ sender: NSButton) {
         guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
+        toggleGateway(kind)
+    }
+
+    // Same toggle from the Sources dropdown (a checkmarked NSMenuItem per source).
+    @objc private func toggleGatewayFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let kind = GatewayKind(rawValue: raw) else { return }
+        toggleGateway(kind)
+    }
+
+    private func toggleGateway(_ kind: GatewayKind) {
         let nowOn = !gatewayEnabled(kind)
         setGatewayEnabled(kind, nowOn)
         if nowOn {
