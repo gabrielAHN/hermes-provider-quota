@@ -1171,19 +1171,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func menuMaterialView(_ frame: NSRect) -> NSView {
-        // ONE background mechanism for every mode: transparent rows over the native
-        // NSMenu vibrancy (a single, seamless, frosted surface — no per-row tint or
-        // divider lines). In a forced theme, ThemedMenuContainer re-themes the menu
-        // WINDOW so that same native vibrancy renders in the chosen appearance — so
-        // Light looks like a clean light version of Dark, with identical translucency
-        // (no second, muddy vibrancy layer). Setting the container's appearance too
-        // makes the text/semantic colours resolve for the theme (dark, readable text
-        // in Light) regardless of when the window override lands.
+        // System mode: transparent rows over the native NSMenu vibrancy (one seamless
+        // frosted surface). A FORCED theme (Light or Dark) uses ONE shared glass
+        // backdrop — the SAME frosted `.menu` NSVisualEffectView and the SAME logic
+        // for both — differing only by appearance (colour). Text uses the fixed
+        // theme-aware colours (menuPrimary/Secondary/Tertiary), so it stays readable
+        // on either glass. `.menu` is uniform/untinted, so rows tile seamlessly.
         let view = ThemedMenuContainer(frame: frame)
         view.forcedAppearance = themedAppearance()
         view.appearance = themedAppearance()
         view.wantsLayer = true
-        view.layer?.backgroundColor = (themedRowBackground() ?? .clear).cgColor
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+        if let themed = themedAppearance() {
+            let glass = NSVisualEffectView(frame: view.bounds)
+            glass.autoresizingMask = [.width, .height]
+            glass.material = .menu
+            glass.blendingMode = .behindWindow
+            glass.state = .active
+            glass.appearance = themed
+            view.addSubview(glass)   // backdrop: added first, row content sits on top
+        }
         return view
     }
 
@@ -2043,14 +2050,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func menuPrimaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.13, alpha: 1) : .labelColor }
     private func menuSecondaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.26, green: 0.26, blue: 0.29, alpha: 1) : .secondaryLabelColor }
     private func menuTertiaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.40, green: 0.40, blue: 0.43, alpha: 1) : .tertiaryLabelColor }
-
-    // Row background for a forced theme. LIGHT gets a SOFT light-grey — not the harsh
-    // bright-white native light vibrancy the user found too bright — lightly
-    // translucent so it still reads as a frosted menu. DARK / System paint nothing
-    // (transparent → the native, seamless dark frosted vibrancy).
-    private func themedRowBackground() -> NSColor? {
-        appAppearanceMode == "light" ? NSColor(srgbRed: 0.90, green: 0.90, blue: 0.925, alpha: 0.94) : nil
-    }
 
     // Push the forced theme onto the live menu window (shared by all item views) so
     // its border/margins match the repainted rows. Best-effort; async catches the
