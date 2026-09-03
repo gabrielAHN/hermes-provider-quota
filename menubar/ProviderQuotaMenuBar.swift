@@ -1216,14 +1216,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
-        // Hidden via the eye → a minimal row: just the provider NAME + a dimmed
-        // eye.slash. It drops all quota info and isn't expandable — and the WHOLE
-        // row is clickable to reveal the provider again (not only the eye).
+        // Hidden via the eye → a minimal row that sits UNDER the shown providers
+        // (rebuildMenu orders hidden ones last per source). It keeps only the
+        // essentials — the provider's colour point, its NAME, and a dimmed
+        // eye.slash — dropping all quota info; it isn't expandable, and the WHOLE
+        // row is clickable to reveal the provider again (not only the eye). Kept
+        // short so a stack of hidden providers takes little room.
         if !providerShownInMenuBar(kind, provider.provider) {
-            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-            row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
-                                 font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
-            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 22))
+            let dot = NSImageView(frame: NSRect(x: 18, y: 7, width: 8, height: 8))
+            dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+            dot.imageScaling = .scaleProportionallyDown
+            dot.contentTintColor = providerBrandColor(provider)
+            row.addSubview(dot)
+            row.addSubview(label(provider.label, frame: NSRect(x: 32, y: 4, width: 250, height: 14),
+                                 font: .systemFont(ofSize: 11, weight: .medium), color: .tertiaryLabelColor))
+            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 3, width: 16, height: 16))
             eyeIcon.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click the row to show")
             eyeIcon.imageScaling = .scaleProportionallyDown
             eyeIcon.contentTintColor = .tertiaryLabelColor
@@ -2085,10 +2093,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 addView(sourceHeaderView(source))
                 if source.connected {
-                    for provider in source.providers {
+                    // Shown providers first, then the hidden ones grouped UNDER
+                    // them as short rows (name + eye + colour point only — see
+                    // providerView), so hiding a provider tucks it below instead of
+                    // leaving a gap in place.
+                    let ordered = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
+                        + source.providers.filter { !providerShownInMenuBar(source.kind, $0.provider) }
+                    for provider in ordered {
                         addView(providerView(provider, kind: source.kind, connected: source.connected))
-                        // Collapsed by default; expand to see per-window detail.
-                        guard expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
+                        // Collapsed by default; expand to see per-window detail. A
+                        // hidden provider is never expanded — its row isn't expandable.
+                        guard providerShownInMenuBar(source.kind, provider.provider),
+                              expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
                         if provider.windows.isEmpty {
                             addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
                         }
