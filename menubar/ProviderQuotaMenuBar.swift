@@ -1074,6 +1074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        applyAppearance()   // restore the saved app theme before building any views
         menu.delegate = self
         statusItem.menu = menu
         activityPanel.onSelect = { [weak self] instance in
@@ -1346,16 +1347,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var controls: [NSButton] = []
 
         if !PetCatalog.installed().isEmpty {
-            controls.append(iconButton(image: NSImage(systemSymbolName: on ? "pawprint.fill" : "pawprint", accessibilityDescription: nil),
-                                       tint: on ? .hermesBlue : .tertiaryLabelColor, dim: !on,
-                                       action: #selector(toggleSourcePet(_:)), key: key,
-                                       tooltip: on ? "Turn off \(name)'s pet" : "Turn on \(name)'s pet"))
+            // Pet picture (the switcher) sits to the LEFT of the paw on/off toggle.
+            // `controls` is laid out left→right, so append the switcher first.
             if on, let pet, PetCatalog.installed().count > 1 {
                 // The switcher IS the pet's picture, so you see what you'll get.
                 controls.append(iconButton(image: PetCatalog.petImage(pet, size: 20), tint: nil,
                                            action: #selector(cycleSourcePet(_:)), key: key,
                                            tooltip: "Switch \(name)'s pet — now \(pet.displayName)"))
             }
+            controls.append(iconButton(image: NSImage(systemSymbolName: on ? "pawprint.fill" : "pawprint", accessibilityDescription: nil),
+                                       tint: on ? .hermesBlue : .tertiaryLabelColor, dim: !on,
+                                       action: #selector(toggleSourcePet(_:)), key: key,
+                                       tooltip: on ? "Turn off \(name)'s pet" : "Turn on \(name)'s pet"))
         }
 
         if kind == .hermes {
@@ -1922,10 +1925,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return view
     }
 
+    // App-only appearance override, independent of the rest of macOS. nil/"system"
+    // follows the OS; "light"/"dark" force it. The app otherwise uses semantic
+    // colours + native menu vibrancy, so forcing .aqua / .darkAqua makes the whole
+    // menu (and pets) match that theme's colours.
+    private var appAppearanceMode: String {
+        get { UserDefaults.standard.string(forKey: "appAppearance") ?? "system" }
+        set { UserDefaults.standard.set(newValue, forKey: "appAppearance") }
+    }
+
+    private func applyAppearance() {
+        switch appAppearanceMode {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark":  NSApp.appearance = NSAppearance(named: .darkAqua)
+        default:      NSApp.appearance = nil   // follow the system
+        }
+    }
+
+    // Icon + tooltip reflect the CURRENT mode (and what a click switches to). The
+    // cycle is System → Light → Dark → System, so "System" stays reachable.
+    private func appearanceSymbolName() -> String {
+        switch appAppearanceMode {
+        case "light": return "sun.max.fill"
+        case "dark":  return "moon.fill"
+        default:      return "circle.lefthalf.filled"   // following the system
+        }
+    }
+
+    private func appearanceTooltip() -> String {
+        switch appAppearanceMode {
+        case "light": return "Theme: Light — click for Dark"
+        case "dark":  return "Theme: Dark — click for System"
+        default:      return "Theme: System — click for Light"
+        }
+    }
+
+    @objc private func cycleAppearance() {
+        switch appAppearanceMode {
+        case "light": appAppearanceMode = "dark"
+        case "dark":  appAppearanceMode = "system"
+        default:      appAppearanceMode = "light"
+        }
+        applyAppearance()
+        updateStatusItem()
+        rebuildMenu()
+        updateActivityPets()
+    }
+
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
         // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar has Check-for-Updates and Close.
+        // bottom bar has an app-theme toggle, Check-for-Updates and Close.
+        let theme = iconActionButton(NSImage(systemSymbolName: appearanceSymbolName(), accessibilityDescription: nil),
+                                     label: appearanceTooltip(),
+                                     action: #selector(cycleAppearance), glowColor: .hermesBlue)
+        theme.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
+        view.addSubview(theme)
+
         let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
                                       label: "Check for Updates (pull latest from the repo)",
                                       action: #selector(checkForUpdates), glowColor: .hermesBlue)
