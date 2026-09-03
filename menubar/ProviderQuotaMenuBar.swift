@@ -1171,26 +1171,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func menuMaterialView(_ frame: NSRect) -> NSView {
-        // System mode: transparent rows over the native NSMenu vibrancy (one seamless
-        // frosted surface). A FORCED theme (Light or Dark) uses ONE shared glass
-        // backdrop — the SAME frosted `.menu` NSVisualEffectView and the SAME logic
-        // for both — differing only by appearance (colour). Text uses the fixed
-        // theme-aware colours (menuPrimary/Secondary/Tertiary), so it stays readable
-        // on either glass. `.menu` is uniform/untinted, so rows tile seamlessly.
+        // ONE glass for every mode: the native NSMenu vibrancy the menu already has.
+        // Rows stay transparent (no extra NSVisualEffectView layered on top — that
+        // second layer was the "frost panel in front"). A forced theme just RE-COLOURS
+        // that native glass by overriding the menu window's appearance
+        // (ThemedMenuContainer), so Light and Dark share the exact same glass and only
+        // the colour switches; System follows the OS. Text uses the fixed theme-aware
+        // colours so it stays readable on either.
         let view = ThemedMenuContainer(frame: frame)
         view.forcedAppearance = themedAppearance()
         view.appearance = themedAppearance()
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
-        if let themed = themedAppearance() {
-            let glass = NSVisualEffectView(frame: view.bounds)
-            glass.autoresizingMask = [.width, .height]
-            glass.material = .menu
-            glass.blendingMode = .behindWindow
-            glass.state = .active
-            glass.appearance = themed
-            view.addSubview(glass)   // backdrop: added first, row content sits on top
-        }
         return view
     }
 
