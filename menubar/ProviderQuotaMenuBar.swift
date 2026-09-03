@@ -1964,27 +1964,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyMenuWindowAppearance()
     }
 
-    // One expanded checkbox row per source: a checkmark box (on/off), the source
-    // name, and a connection dot. The WHOLE row toggles that source and the menu
-    // stays open, so you can multi-select. Rendered indented under the Sources row.
+    // One expanded row per source, styled as an ACTIVATION SECTION (not a checkbox):
+    // a rounded chip that FILLS with the source's status colour when active and sits
+    // as a plain outline when off. A leading status dot + a right-aligned state label
+    // ("Active" / "Activating…" / "Not signed in" / "Off") make the state obvious.
+    // The whole row toggles the source and the menu stays open, so you can activate
+    // one or both.
     private func sourceOptionRow(_ kind: GatewayKind) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 28))
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 34))
         let on = gatewayEnabled(kind)
-        let box = NSImageView(frame: NSRect(x: 42, y: 6, width: 16, height: 16))
-        box.image = NSImage(systemSymbolName: on ? "checkmark.square.fill" : "square", accessibilityDescription: nil)
-        box.contentTintColor = on ? .hermesBlue : menuTertiaryColor()
-        box.imageScaling = .scaleProportionallyDown
-        view.addSubview(box)
-        view.addSubview(label(sourceName(kind), frame: NSRect(x: 66, y: 6, width: 180, height: 16),
-                              font: .systemFont(ofSize: 12, weight: on ? .medium : .regular),
+        let loading = activating.contains(kind)
+        let connected = sources.first { $0.kind == kind }?.connected ?? false
+        // Accent = the state colour: blue while activating, green connected, red
+        // signed-out; grey when the section is off.
+        let accent: NSColor = !on ? .tertiaryLabelColor
+            : loading ? .hermesBlue
+            : connected ? .hermesGreen : .hermesRed
+
+        let chip = NSView(frame: NSRect(x: 38, y: 4, width: 306, height: 26))
+        chip.wantsLayer = true
+        chip.layer?.cornerRadius = 7
+        chip.layer?.backgroundColor = (on ? accent.withAlphaComponent(0.16) : NSColor.clear).cgColor
+        chip.layer?.borderColor = (on ? accent.withAlphaComponent(0.55)
+                                      : NSColor.separatorColor.withAlphaComponent(0.55)).cgColor
+        chip.layer?.borderWidth = 1
+        view.addSubview(chip)
+
+        let dot = NSImageView(frame: NSRect(x: 50, y: 12, width: 10, height: 10))
+        dot.image = NSImage(systemSymbolName: on ? "circle.fill" : "circle", accessibilityDescription: nil)
+        dot.contentTintColor = on ? accent : menuTertiaryColor()
+        dot.imageScaling = .scaleProportionallyDown
+        view.addSubview(dot)
+
+        view.addSubview(label(sourceName(kind), frame: NSRect(x: 68, y: 9, width: 150, height: 16),
+                              font: .systemFont(ofSize: 12, weight: on ? .semibold : .regular),
                               color: on ? menuPrimaryColor() : menuSecondaryColor()))
-        if on {
-            let connected = sources.first { $0.kind == kind }?.connected ?? false
-            let dot = NSImageView(frame: NSRect(x: 322, y: 9, width: 9, height: 9))
-            dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
-            dot.contentTintColor = connected ? .hermesGreen : .hermesRed
-            view.addSubview(dot)
-        }
+
+        let state = !on ? "Off" : loading ? "Activating…" : connected ? "Active" : "Not signed in"
+        view.addSubview(label(state, frame: NSRect(x: 196, y: 9, width: 140, height: 16),
+                              font: .systemFont(ofSize: 10.5, weight: .medium),
+                              color: on ? accent : menuTertiaryColor(), alignment: .right))
+
         let button = NSButton(frame: view.bounds)
         button.isBordered = false
         button.title = ""
@@ -2302,18 +2322,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Shown in place of a source's block while it's activating (just switched on,
-    // fetching its first quotas): a spinner + "Activating <source>…".
+    // fetching its first quotas). Styled like the source's own SECTION HEADER — its
+    // name uppercased with a spinner where the connection dot would be, plus a
+    // right-aligned "Loading…" — so the loading reads as happening inside that
+    // source's section (and the pet stays hidden until it's done).
     private func loadingRowView(name: String) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-        let spinner = NSProgressIndicator(frame: NSRect(x: 16, y: 8, width: 14, height: 14))
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 28))
+        let spinner = NSProgressIndicator(frame: NSRect(x: 15, y: 8, width: 12, height: 12))
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isIndeterminate = true
         spinner.usesThreadedAnimation = true   // keeps spinning while the menu tracks
         spinner.startAnimation(nil)
         view.addSubview(spinner)
-        view.addSubview(label("Activating \(name)…", frame: NSRect(x: 38, y: 8, width: 280, height: 14),
-                              font: .systemFont(ofSize: 11, weight: .medium), color: menuSecondaryColor()))
+        view.addSubview(label(name.uppercased(), frame: NSRect(x: 30, y: 8, width: 150, height: 14),
+                              font: .systemFont(ofSize: 10, weight: .semibold), color: menuSecondaryColor()))
+        view.addSubview(label("Loading…", frame: NSRect(x: 190, y: 8, width: 154, height: 14),
+                              font: .systemFont(ofSize: 10.5), color: menuTertiaryColor(), alignment: .right))
         return view
     }
 
@@ -2543,13 +2568,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let petSources = enabledGateways().filter { PetCatalog.petEnabled(forKey: $0.rawValue) }
         if petSources.isEmpty { return [] }
 
-        if needsLogin {
-            let name = petSources.map { sourceName($0) }.joined(separator: " / ")
-            return [PetTile(instance: Self.needsLoginPlaceholder(gateway: name),
-                            pet: PetCatalog.selected(forKey: petSources[0].rawValue),
-                            sourceKey: petSources[0].rawValue)]
-        }
-
         // ONE pet per source. It shows a dot ONLY for each session that's actively
         // RUNNING, in that session's provider colour. When a session finishes its
         // dot simply disappears — no lingering checkmark — and when nothing is
@@ -2557,6 +2575,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var tiles: [PetTile] = []
         for kind in petSources {
             let pet = PetCatalog.selected(forKey: kind.rawValue)
+            // While a source is still ACTIVATING (just switched on, fetching its
+            // first data) show NO pet at all — not even the error pet. The pet only
+            // appears once loading is DONE: the idle/working pet if it connected, or
+            // the error pet if it came back disconnected (e.g. Hermes Desktop not
+            // signed in).
+            if activating.contains(kind) { continue }
             let connected = sources.first { $0.kind == kind }?.connected ?? false
             if !connected {
                 tiles.append(PetTile(instance: Self.needsLoginPlaceholder(gateway: sourceName(kind)), pet: pet, sourceKey: kind.rawValue))
@@ -3040,9 +3064,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh() {
         guard !refreshing else { return }
         refreshing = true
+        let kinds = enabledGateways()   // fetch EVERY enabled source
+        // A source with no data yet is LOADING — mark it activating so its pet stays
+        // hidden (and its section shows a loading row) until data lands, instead of
+        // flashing the "error" pet during the first fetch. Sources that already have
+        // data keep their pet through a periodic refresh.
+        for kind in kinds where !sources.contains(where: { $0.kind == kind }) {
+            activating.insert(kind)
+        }
         updateStatusItem()
         rebuildMenu()
-        let kinds = enabledGateways()   // fetch EVERY enabled source
+        updateActivityPets()   // reflect the hidden pet immediately
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let desktop = Self.fetchDesktopStatus()
             let results: [(kind: GatewayKind, result: Result<QuotaPayload, Error>)] =
