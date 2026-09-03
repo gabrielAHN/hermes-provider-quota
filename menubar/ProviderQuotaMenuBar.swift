@@ -1169,22 +1169,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func menuMaterialView(_ frame: NSRect) -> NSView {
-        // Transparent container: let the native NSMenu vibrancy be the ONE
-        // continuous background for the whole menu. Previously each section was
-        // its own .sidebar NSVisualEffectView with a translucent tint, so the
-        // materials stacked per-row and produced the patchy/"weird" banding.
-        // Plain, uncoloured section container — the native NSMenu vibrancy is the
-        // single seamless background. No per-section tint and no divider lines
-        // (rebuildMenu no longer inserts separators), so the menu reads as one
-        // clean translucent surface.
-        // Transparent container in ALL modes: the native menu vibrancy stays the one
-        // continuous background. In a forced theme, ThemedMenuContainer re-themes the
-        // menu window so that vibrancy (and semantic colours) render for the chosen
-        // theme — keeping the translucent effect in both Light and Dark.
+        // System mode: transparent container so the native NSMenu vibrancy is the
+        // ONE continuous, seamless background (no per-section tint, no dividers).
+        //
+        // Forced theme: the native window vibrancy can't be re-themed reliably, so
+        // (1) set the container's appearance so all text/semantic colours resolve
+        // for the theme (readable dark text in Light), and (2) lay down a themed
+        // `.menu` NSVisualEffectView so the dropdown keeps the SAME translucent,
+        // frosted blur as the other theme — just in the chosen appearance. `.menu`
+        // (untinted, uniform) tiles seamlessly, avoiding the old per-row banding.
         let view = ThemedMenuContainer(frame: frame)
         view.forcedAppearance = themedAppearance()
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
+        if let themed = themedAppearance() {
+            view.appearance = themed
+            let fx = NSVisualEffectView(frame: view.bounds)
+            fx.autoresizingMask = [.width, .height]
+            fx.material = .menu
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            fx.appearance = themed
+            view.addSubview(fx)   // backdrop: added first, so row content sits on top
+        }
         return view
     }
 
