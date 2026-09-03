@@ -1169,29 +1169,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func menuMaterialView(_ frame: NSRect) -> NSView {
-        // System mode: transparent container so the native NSMenu vibrancy is the
-        // ONE continuous, seamless background (no per-section tint, no dividers).
-        //
-        // Forced theme: the native window vibrancy can't be re-themed reliably, so
-        // (1) set the container's appearance so all text/semantic colours resolve
-        // for the theme (readable dark text in Light), and (2) lay down a themed
-        // `.menu` NSVisualEffectView so the dropdown keeps the SAME translucent,
-        // frosted blur as the other theme — just in the chosen appearance. `.menu`
-        // (untinted, uniform) tiles seamlessly, avoiding the old per-row banding.
+        // ONE background mechanism for every mode: transparent rows over the native
+        // NSMenu vibrancy (a single, seamless, frosted surface — no per-row tint or
+        // divider lines). In a forced theme, ThemedMenuContainer re-themes the menu
+        // WINDOW so that same native vibrancy renders in the chosen appearance — so
+        // Light looks like a clean light version of Dark, with identical translucency
+        // (no second, muddy vibrancy layer). Setting the container's appearance too
+        // makes the text/semantic colours resolve for the theme (dark, readable text
+        // in Light) regardless of when the window override lands.
         let view = ThemedMenuContainer(frame: frame)
         view.forcedAppearance = themedAppearance()
+        view.appearance = themedAppearance()
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
-        if let themed = themedAppearance() {
-            view.appearance = themed
-            let fx = NSVisualEffectView(frame: view.bounds)
-            fx.autoresizingMask = [.width, .height]
-            fx.material = .menu
-            fx.blendingMode = .behindWindow
-            fx.state = .active
-            fx.appearance = themed
-            view.addSubview(fx)   // backdrop: added first, so row content sits on top
-        }
         return view
     }
 
