@@ -196,6 +196,20 @@ final class HoverGlowButton: NSButton {
     }
 }
 
+// A transparent menu-row container that, the moment it lands in the menu's window,
+// forces that window's appearance to the app's chosen theme. That re-themes the
+// NATIVE menu vibrancy (which otherwise always renders in the system appearance),
+// so the dropdown keeps its translucent effect in BOTH Light and Dark — and the
+// semantic text/label colours resolve for the theme automatically. nil = follow
+// the system.
+final class ThemedMenuContainer: NSView {
+    var forcedAppearance: NSAppearance?
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.appearance = forcedAppearance
+    }
+}
+
 final class HoverGlowSwitch: NSSwitch {
     private var hoverArea: NSTrackingArea?
     private var hovering = false
@@ -1031,6 +1045,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Providers whose detail is expanded (collapsed by default → brief row with a
     // bar; click to expand for per-window info). Session-scoped.
     private var expandedProviders = Set<String>()
+    // Whether the Sources selector is expanded to show its per-source checkboxes.
+    private var sourcesExpanded = false
     // Last provider slug→label from a successful fetch, PER source, so a
     // disconnected (or freshly-switched) source lists only its own providers, and
     // disabling a source can drop its providers entirely.
@@ -1074,6 +1090,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        applyAppearance()   // restore the saved app theme before building any views
         menu.delegate = self
         statusItem.menu = menu
         activityPanel.onSelect = { [weak self] instance in
@@ -1127,6 +1144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu()
+        applyMenuWindowAppearance()   // theme the dropdown to match the forced mode
         refreshDesktopStatus()
         syncPetsFromGateway()  // reflect a pet installed since the last open
     }
@@ -1140,26 +1158,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.setAccessibilityLabel("Provider quota status")
     }
 
-    private func label(_ text: String, frame: NSRect, font: NSFont, color: NSColor = .labelColor, alignment: NSTextAlignment = .left) -> NSTextField {
+    // `color: nil` → the theme-aware PRIMARY colour (explicit dark grey in a light
+    // theme, so text never renders light-on-light regardless of appearance cascade).
+    private func label(_ text: String, frame: NSRect, font: NSFont, color: NSColor? = nil, alignment: NSTextAlignment = .left) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.frame = frame
         field.font = font
-        field.textColor = color
+        field.textColor = color ?? menuPrimaryColor()
         field.alignment = alignment
         field.lineBreakMode = .byTruncatingTail
         return field
     }
 
     private func menuMaterialView(_ frame: NSRect) -> NSView {
-        // Transparent container: let the native NSMenu vibrancy be the ONE
-        // continuous background for the whole menu. Previously each section was
-        // its own .sidebar NSVisualEffectView with a translucent tint, so the
-        // materials stacked per-row and produced the patchy/"weird" banding.
-        // Plain, uncoloured section container — the native NSMenu vibrancy is the
-        // single seamless background. No per-section tint and no divider lines
-        // (rebuildMenu no longer inserts separators), so the menu reads as one
-        // clean translucent surface.
-        let view = NSView(frame: frame)
+        // ONE glass for every mode: the native NSMenu vibrancy the menu already has.
+        // Rows stay transparent (no extra NSVisualEffectView layered on top — that
+        // second layer was the "frost panel in front"). A forced theme just RE-COLOURS
+        // that native glass by overriding the menu window's appearance
+        // (ThemedMenuContainer), so Light and Dark share the exact same glass and only
+        // the colour switches; System follows the OS. Text uses the fixed theme-aware
+        // colours so it stays readable on either.
+        let view = ThemedMenuContainer(frame: frame)
+        view.forcedAppearance = themedAppearance()
+        view.appearance = themedAppearance()
         view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.clear.cgColor
         return view
@@ -1173,12 +1194,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func titleView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 68))
-        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold)))
+        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold), color: menuPrimaryColor()))
         let connection = connectionSummary()
         view.addSubview(label(connection, frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: anyConnected ? .hermesGreen : .hermesRed))
         let generatedAt = sources.compactMap { $0.generatedAt }.first
         let updated = formattedRelativeDate(generatedAt).map { "Updated \($0)" } ?? "Provider quotas"
-        view.addSubview(label(updated, frame: NSRect(x: 16, y: 4, width: 300, height: 16), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(updated, frame: NSRect(x: 16, y: 4, width: 300, height: 16), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         let image = NSImageView(frame: NSRect(x: 320, y: 28, width: 22, height: 22))
         image.image = NSImage(systemSymbolName: "gauge.with.dots.needle.50percent", accessibilityDescription: "Quotas")
         image.contentTintColor = .hermesBlue
@@ -1216,17 +1237,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func providerView(_ provider: QuotaProvider, kind: GatewayKind, connected: Bool) -> NSView {
         let key = providerKey(kind, provider.provider)
 
-        // Hidden via the eye → a minimal row: just the provider NAME + a dimmed
-        // eye.slash. It drops all quota info and isn't expandable — and the WHOLE
-        // row is clickable to reveal the provider again (not only the eye).
+        // Hidden via the eye → a minimal row that sits UNDER the shown providers
+        // (rebuildMenu orders hidden ones last per source). It keeps only the
+        // essentials — the provider's colour point, its NAME, and a dimmed
+        // eye.slash — dropping all quota info; it isn't expandable, and the WHOLE
+        // row is clickable to reveal the provider again (not only the eye). Kept
+        // short so a stack of hidden providers takes little room.
         if !providerShownInMenuBar(kind, provider.provider) {
-            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-            row.addSubview(label(provider.label, frame: NSRect(x: 16, y: 7, width: 250, height: 16),
-                                 font: .systemFont(ofSize: 12, weight: .medium), color: .tertiaryLabelColor))
-            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 6, width: 18, height: 18))
+            let row = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 22))
+            let dot = NSImageView(frame: NSRect(x: 18, y: 7, width: 8, height: 8))
+            dot.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)
+            dot.imageScaling = .scaleProportionallyDown
+            dot.contentTintColor = providerBrandColor(provider)
+            row.addSubview(dot)
+            row.addSubview(label(provider.label, frame: NSRect(x: 32, y: 4, width: 250, height: 14),
+                                 font: .systemFont(ofSize: 11, weight: .medium), color: menuTertiaryColor()))
+            let eyeIcon = NSImageView(frame: NSRect(x: 300, y: 3, width: 16, height: 16))
             eyeIcon.image = NSImage(systemSymbolName: "eye.slash", accessibilityDescription: "Hidden — click the row to show")
             eyeIcon.imageScaling = .scaleProportionallyDown
-            eyeIcon.contentTintColor = .tertiaryLabelColor
+            eyeIcon.contentTintColor = menuTertiaryColor()
             row.addSubview(eyeIcon)
             // Whole-row reveal button on top: click anywhere to show the provider.
             let reveal = NSButton(frame: row.bounds)
@@ -1244,7 +1273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let expanded = expandedProviders.contains(key)
         let chevron = NSImageView(frame: NSRect(x: 13, y: 18, width: 12, height: 12))
         chevron.image = NSImage(systemSymbolName: expanded ? "chevron.down" : "chevron.right", accessibilityDescription: expanded ? "Collapse" : "Expand")
-        chevron.contentTintColor = .tertiaryLabelColor
+        chevron.contentTintColor = menuTertiaryColor()
         view.addSubview(chevron)
         let symbol = providerSymbolName(provider.provider)
         let image = NSImageView(frame: NSRect(x: 32, y: 25, width: 16, height: 16))
@@ -1255,7 +1284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(image)
         view.addSubview(label(provider.label, frame: NSRect(x: 56, y: 26, width: 150, height: 18), font: .systemFont(ofSize: 13, weight: .semibold), color: providerBrandColor(provider)))
         if let plan = provider.plan {
-            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: .tertiaryLabelColor, alignment: .right))
+            view.addSubview(label(plan.uppercased(), frame: NSRect(x: 200, y: 28, width: 90, height: 15), font: .systemFont(ofSize: 9, weight: .medium), color: menuTertiaryColor(), alignment: .right))
         }
         let statusImage = NSImageView(frame: NSRect(x: 322, y: 27, width: 14, height: 14))
         statusImage.image = providerDotImage(provider, size: 14, connected: connected)
@@ -1263,7 +1292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Brief line: summary text + an overall provider-coloured bar. Same font
         // and colour regardless of status (out of quota / offline included) so the
         // provider info always reads the same; the status dot conveys any problem.
-        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(providerSummary(provider, connected: connected), frame: NSRect(x: 56, y: 7, width: 170, height: 15), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         // Bar tracks the collapsed %: the current-session window for %-based
         // providers (Codex/Claude); amount-only providers (OpenRouter) keep their
         // existing bar via the min fallback.
@@ -1324,7 +1353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dot.contentTintColor = source.connected ? .hermesGreen : .hermesRed
         view.addSubview(dot)
         view.addSubview(label(name.uppercased(), frame: NSRect(x: 30, y: 8, width: 66, height: 14),
-                              font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor))
+                              font: .systemFont(ofSize: 10, weight: .semibold), color: menuSecondaryColor()))
         // The dot's colour already conveys the connection state; a row tooltip
         // spells it out, so the width goes to clearly-labelled controls instead.
         view.toolTip = "\(name) — \(source.connected ? "connected" : "disconnected")"
@@ -1338,16 +1367,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var controls: [NSButton] = []
 
         if !PetCatalog.installed().isEmpty {
-            controls.append(iconButton(image: NSImage(systemSymbolName: on ? "pawprint.fill" : "pawprint", accessibilityDescription: nil),
-                                       tint: on ? .hermesBlue : .tertiaryLabelColor, dim: !on,
-                                       action: #selector(toggleSourcePet(_:)), key: key,
-                                       tooltip: on ? "Turn off \(name)'s pet" : "Turn on \(name)'s pet"))
+            // Pet picture (the switcher) sits to the LEFT of the paw on/off toggle.
+            // `controls` is laid out left→right, so append the switcher first.
             if on, let pet, PetCatalog.installed().count > 1 {
                 // The switcher IS the pet's picture, so you see what you'll get.
                 controls.append(iconButton(image: PetCatalog.petImage(pet, size: 20), tint: nil,
                                            action: #selector(cycleSourcePet(_:)), key: key,
                                            tooltip: "Switch \(name)'s pet — now \(pet.displayName)"))
             }
+            controls.append(iconButton(image: NSImage(systemSymbolName: on ? "pawprint.fill" : "pawprint", accessibilityDescription: nil),
+                                       tint: on ? .hermesBlue : .tertiaryLabelColor, dim: !on,
+                                       action: #selector(toggleSourcePet(_:)), key: key,
+                                       tooltip: on ? "Turn off \(name)'s pet" : "Turn on \(name)'s pet"))
         }
 
         if kind == .hermes {
@@ -1787,7 +1818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the quota is low so it stands out.
         let low = window.remainingPercent.map { $0 <= 15 } ?? false
         let bar = hasValue ? barColor(for: provider, remainingPercent: window.remainingPercent) : NSColor.tertiaryLabelColor
-        let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : NSColor.labelColor) : NSColor.tertiaryLabelColor
+        let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : menuPrimaryColor()) : menuTertiaryColor()
         view.addSubview(label(window.label, frame: NSRect(x: 28, y: 40, width: 170, height: 18), font: .systemFont(ofSize: 12, weight: .medium)))
         let displayValue: String
         if let amount = window.remainingAmount {
@@ -1821,7 +1852,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             subtitle = "No reset time reported"
         }
-        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
     }
 
@@ -1829,15 +1860,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 25))
         let image = NSImageView(frame: NSRect(x: 28, y: 6, width: 12, height: 12))
         image.image = NSImage(systemSymbolName: "creditcard", accessibilityDescription: nil)
-        image.contentTintColor = .tertiaryLabelColor
+        image.contentTintColor = menuTertiaryColor()
         view.addSubview(image)
-        view.addSubview(label(detail, frame: NSRect(x: 47, y: 4, width: 293, height: 17), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(detail, frame: NSRect(x: 47, y: 4, width: 293, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
     }
 
-    private func messageView(_ message: String, color: NSColor = .secondaryLabelColor) -> NSView {
+    private func messageView(_ message: String, color: NSColor? = nil) -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-        view.addSubview(label(message, frame: NSRect(x: 28, y: 6, width: 312, height: 18), font: .systemFont(ofSize: 11), color: color))
+        view.addSubview(label(message, frame: NSRect(x: 28, y: 6, width: 312, height: 18), font: .systemFont(ofSize: 11), color: color ?? menuSecondaryColor()))
         return view
     }
 
@@ -1854,7 +1885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? "Not signed in — sign in to see quotas"
             : "Sign in to your local providers to see quotas"
         view.addSubview(label(msg, frame: NSRect(x: 54, y: 15, width: 196, height: 15),
-                              font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+                              font: .systemFont(ofSize: 11), color: menuSecondaryColor()))
         if source.kind == .hermes {
             let btn = textActionButton("Sign in", action: #selector(signInGateway), glowColor: .hermesGreen)
             btn.frame = NSRect(x: 258, y: 9, width: 88, height: 26)
@@ -1883,10 +1914,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return button
     }
 
-    // The sources are configured by the user: two enable chips — Hermes (the
-    // gateway) and Local (locally-authenticated providers) — both OFF by default.
-    // Enable one or BOTH; when both are on, both sources' providers are shown
-    // together. No fallback. Disabling a chip drops that source's providers.
+    private static let sourceOrder: [GatewayKind] = [.hermes, .local]
+
+    // The sources are configured by the user via a multi-select dropdown — Hermes
+    // (the gateway) and Local (locally-authenticated providers), both OFF by
+    // default. The "Sources" row is a disclosure: click it to expand a checkbox per
+    // source (rendered by rebuildMenu as sourceOptionRow), so you can activate one
+    // or BOTH and it STAYS OPEN while you toggle. No fallback — deselecting a source
+    // drops its providers.
     private func gatewayRowView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 40))
         let enabled = enabledGateways()
@@ -1895,29 +1930,194 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         icon.contentTintColor = enabled.isEmpty ? .tertiaryLabelColor : (anyConnected ? .hermesBlue : .hermesRed)
         view.addSubview(icon)
 
-        view.addSubview(label("Sources", frame: NSRect(x: 42, y: 12, width: 150, height: 16),
+        view.addSubview(label("Sources", frame: NSRect(x: 42, y: 12, width: 90, height: 16),
                               font: .systemFont(ofSize: 12, weight: .medium)))
 
-        // Per-source enable chips (independent on/off; enable both to see both).
-        for (kind, cx) in [(GatewayKind.hermes, CGFloat(210)), (GatewayKind.local, CGFloat(278))] {
-            let name = sourceName(kind)
-            let on = gatewayEnabled(kind)
-            let connected = sources.first { $0.kind == kind }?.connected ?? false
-            let glow: NSColor = !on ? .disabledControlTextColor : (connected ? .hermesGreen : .hermesRed)
-            let chip = textActionButton(name, action: #selector(toggleGatewayEnabled(_:)), glowColor: glow)
-            chip.frame = NSRect(x: cx, y: 7, width: 64, height: 26)
-            chip.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
-            chip.alphaValue = on ? 1.0 : 0.55
-            chip.toolTip = on ? "Disable \(name) (removes its providers)" : "Enable \(name)"
-            view.addSubview(chip)
-        }
+        // Right-aligned summary of what's active + a disclosure chevron. A plain
+        // NSButton in the row (reliable — nested NSMenus don't work inside a
+        // status-bar menu, which is why the old pull-down didn't respond).
+        let active = Self.sourceOrder.filter { gatewayEnabled($0) }
+        let summary = active.isEmpty ? "Select…" : active.map { sourceName($0) }.joined(separator: ", ")
+        view.addSubview(label(summary, frame: NSRect(x: 176, y: 12, width: 150, height: 16),
+                              font: .systemFont(ofSize: 12), color: active.isEmpty ? menuTertiaryColor() : menuSecondaryColor(),
+                              alignment: .right))
+        let chevron = NSImageView(frame: NSRect(x: 334, y: 13, width: 12, height: 14))
+        chevron.image = NSImage(systemSymbolName: sourcesExpanded ? "chevron.up" : "chevron.down", accessibilityDescription: nil)
+        chevron.contentTintColor = menuTertiaryColor()
+        chevron.imageScaling = .scaleProportionallyDown
+        view.addSubview(chevron)
+
+        // Whole-row toggle for the disclosure.
+        let button = NSButton(frame: view.bounds)
+        button.isBordered = false
+        button.title = ""
+        button.target = self
+        button.action = #selector(toggleSourcesExpanded)
+        button.toolTip = sourcesExpanded ? "Hide sources" : "Choose which sources are active"
+        view.addSubview(button)
         return view
+    }
+
+    @objc private func toggleSourcesExpanded() {
+        sourcesExpanded.toggle()
+        rebuildMenu()
+        applyMenuWindowAppearance()
+    }
+
+    // One expanded row per source, styled as an ACTIVATION SECTION (not a checkbox):
+    // a rounded chip that FILLS with the source's status colour when active and sits
+    // as a plain outline when off. A leading status dot + a right-aligned state label
+    // ("Active" / "Activating…" / "Not signed in" / "Off") make the state obvious.
+    // The whole row toggles the source and the menu stays open, so you can activate
+    // one or both.
+    private func sourceOptionRow(_ kind: GatewayKind) -> NSView {
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 34))
+        let on = gatewayEnabled(kind)
+        let loading = activating.contains(kind)
+        let connected = sources.first { $0.kind == kind }?.connected ?? false
+        // Accent = the state colour: blue while activating, green connected, red
+        // signed-out; grey when the section is off.
+        let accent: NSColor = !on ? .tertiaryLabelColor
+            : loading ? .hermesBlue
+            : connected ? .hermesGreen : .hermesRed
+
+        let chip = NSView(frame: NSRect(x: 38, y: 4, width: 306, height: 26))
+        chip.wantsLayer = true
+        chip.layer?.cornerRadius = 7
+        chip.layer?.backgroundColor = (on ? accent.withAlphaComponent(0.16) : NSColor.clear).cgColor
+        chip.layer?.borderColor = (on ? accent.withAlphaComponent(0.55)
+                                      : NSColor.separatorColor.withAlphaComponent(0.55)).cgColor
+        chip.layer?.borderWidth = 1
+        view.addSubview(chip)
+
+        let dot = NSImageView(frame: NSRect(x: 50, y: 12, width: 10, height: 10))
+        dot.image = NSImage(systemSymbolName: on ? "circle.fill" : "circle", accessibilityDescription: nil)
+        dot.contentTintColor = on ? accent : menuTertiaryColor()
+        dot.imageScaling = .scaleProportionallyDown
+        view.addSubview(dot)
+
+        view.addSubview(label(sourceName(kind), frame: NSRect(x: 68, y: 9, width: 150, height: 16),
+                              font: .systemFont(ofSize: 12, weight: on ? .semibold : .regular),
+                              color: on ? menuPrimaryColor() : menuSecondaryColor()))
+
+        let state = !on ? "Off" : loading ? "Activating…" : connected ? "Active" : "Not signed in"
+        view.addSubview(label(state, frame: NSRect(x: 196, y: 9, width: 140, height: 16),
+                              font: .systemFont(ofSize: 10.5, weight: .medium),
+                              color: on ? accent : menuTertiaryColor(), alignment: .right))
+
+        let button = NSButton(frame: view.bounds)
+        button.isBordered = false
+        button.title = ""
+        button.identifier = NSUserInterfaceItemIdentifier(kind.rawValue)
+        button.target = self
+        button.action = #selector(toggleGatewayEnabled(_:))
+        button.toolTip = on ? "Deactivate \(sourceName(kind))" : "Activate \(sourceName(kind))"
+        view.addSubview(button)
+        return view
+    }
+
+    // App-only appearance override, independent of the rest of macOS. nil/"system"
+    // follows the OS; "light"/"dark" force it. The app otherwise uses semantic
+    // colours + native menu vibrancy, so forcing .aqua / .darkAqua makes the whole
+    // menu (and pets) match that theme's colours.
+    private var appAppearanceMode: String {
+        get { UserDefaults.standard.string(forKey: "appAppearance") ?? "system" }
+        set { UserDefaults.standard.set(newValue, forKey: "appAppearance") }
+    }
+
+    private func applyAppearance() {
+        switch appAppearanceMode {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark":  NSApp.appearance = NSAppearance(named: .darkAqua)
+        default:      NSApp.appearance = nil   // follow the system
+        }
+    }
+
+    // The NSAppearance the app theme forces (nil = follow the system). A status-bar
+    // NSMenu renders in the SYSTEM appearance regardless of NSApp.appearance, so we
+    // also (a) override the menu window's appearance as it opens and (b) paint each
+    // row an opaque themed background — together they re-theme the dropdown.
+    private func themedAppearance() -> NSAppearance? {
+        switch appAppearanceMode {
+        case "light": return NSAppearance(named: .aqua)
+        case "dark":  return NSAppearance(named: .darkAqua)
+        default:      return nil
+        }
+    }
+
+    // Whether the menu is effectively rendering LIGHT (forced Light, or System while
+    // macOS is light). The translucent light menu washes out the default tertiary/
+    // secondary greys, so muted text roles darken in that case only.
+    private var isLightTheme: Bool {
+        switch appAppearanceMode {
+        case "light": return true
+        case "dark":  return false
+        default:      return NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) != .darkAqua
+        }
+    }
+
+    // Explicit text colours for a light theme, so readability never depends on
+    // semantic-colour resolution (which could render light-on-light). Fixed dark
+    // greys on the soft light background; native greys in dark.
+    private func menuPrimaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.13, alpha: 1) : .labelColor }
+    private func menuSecondaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.26, green: 0.26, blue: 0.29, alpha: 1) : .secondaryLabelColor }
+    private func menuTertiaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.40, green: 0.40, blue: 0.43, alpha: 1) : .tertiaryLabelColor }
+
+    // Push the forced theme onto the live menu window (shared by all item views) so
+    // its border/margins match the repainted rows. Best-effort; async catches the
+    // window once AppKit has created it for display.
+    private func applyMenuWindowAppearance() {
+        let appearance = themedAppearance()
+        let assign: () -> Void = { [weak menu] in
+            if let window = menu?.items.lazy.compactMap({ $0.view?.window }).first {
+                window.appearance = appearance
+            }
+        }
+        assign()
+        DispatchQueue.main.async(execute: assign)
+    }
+
+    // Icon + tooltip reflect the CURRENT mode (and what a click switches to). The
+    // cycle is System → Light → Dark → System, so "System" stays reachable.
+    private func appearanceSymbolName() -> String {
+        switch appAppearanceMode {
+        case "light": return "sun.max.fill"
+        case "dark":  return "moon.fill"
+        default:      return "circle.lefthalf.filled"   // following the system
+        }
+    }
+
+    private func appearanceTooltip() -> String {
+        switch appAppearanceMode {
+        case "light": return "Theme: Light — click for Dark"
+        case "dark":  return "Theme: Dark — click for System"
+        default:      return "Theme: System — click for Light"
+        }
+    }
+
+    @objc private func cycleAppearance() {
+        switch appAppearanceMode {
+        case "light": appAppearanceMode = "dark"
+        case "dark":  appAppearanceMode = "system"
+        default:      appAppearanceMode = "light"
+        }
+        applyAppearance()
+        updateStatusItem()
+        rebuildMenu()
+        applyMenuWindowAppearance()   // retheme the open dropdown live
+        updateActivityPets()
     }
 
     private func actionBarView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 42))
         // Refresh is per-provider now (a refresh icon on each provider row), so the
-        // bottom bar has Check-for-Updates and Close.
+        // bottom bar has an app-theme toggle, Check-for-Updates and Close.
+        let theme = iconActionButton(NSImage(systemSymbolName: appearanceSymbolName(), accessibilityDescription: nil),
+                                     label: appearanceTooltip(),
+                                     action: #selector(cycleAppearance), glowColor: .hermesBlue)
+        theme.frame = NSRect(x: 250, y: 7, width: 28, height: 28)
+        view.addSubview(theme)
+
         let update = iconActionButton(NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil),
                                       label: "Check for Updates (pull latest from the repo)",
                                       action: #selector(checkForUpdates), glowColor: .hermesBlue)
@@ -2068,6 +2268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         addView(titleView())
         addView(gatewayRowView())
+        if sourcesExpanded {
+            for kind in Self.sourceOrder { addView(sourceOptionRow(kind)) }
+        }
         let enabled = enabledGateways()
         if enabled.isEmpty {
             addView(messageView("Enable Hermes or Local above"))
@@ -2085,10 +2288,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 addView(sourceHeaderView(source))
                 if source.connected {
-                    for provider in source.providers {
+                    // Shown providers first, then the hidden ones grouped UNDER
+                    // them as short rows (name + eye + colour point only — see
+                    // providerView), so hiding a provider tucks it below instead of
+                    // leaving a gap in place.
+                    let ordered = source.providers.filter { providerShownInMenuBar(source.kind, $0.provider) }
+                        + source.providers.filter { !providerShownInMenuBar(source.kind, $0.provider) }
+                    for provider in ordered {
                         addView(providerView(provider, kind: source.kind, connected: source.connected))
-                        // Collapsed by default; expand to see per-window detail.
-                        guard expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
+                        // Collapsed by default; expand to see per-window detail. A
+                        // hidden provider is never expanded — its row isn't expandable.
+                        guard providerShownInMenuBar(source.kind, provider.provider),
+                              expandedProviders.contains(providerKey(source.kind, provider.provider)) else { continue }
                         if provider.windows.isEmpty {
                             addView(messageView(provider.message ?? provider.status.replacingOccurrences(of: "_", with: " "), color: .hermesOrange))
                         }
@@ -2111,18 +2322,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // Shown in place of a source's block while it's activating (just switched on,
-    // fetching its first quotas): a spinner + "Activating <source>…".
+    // fetching its first quotas). Styled like the source's own SECTION HEADER — its
+    // name uppercased with a spinner where the connection dot would be, plus a
+    // right-aligned "Loading…" — so the loading reads as happening inside that
+    // source's section (and the pet stays hidden until it's done).
     private func loadingRowView(name: String) -> NSView {
-        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-        let spinner = NSProgressIndicator(frame: NSRect(x: 16, y: 8, width: 14, height: 14))
+        let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 28))
+        let spinner = NSProgressIndicator(frame: NSRect(x: 15, y: 8, width: 12, height: 12))
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isIndeterminate = true
         spinner.usesThreadedAnimation = true   // keeps spinning while the menu tracks
         spinner.startAnimation(nil)
         view.addSubview(spinner)
-        view.addSubview(label("Activating \(name)…", frame: NSRect(x: 38, y: 8, width: 280, height: 14),
-                              font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor))
+        view.addSubview(label(name.uppercased(), frame: NSRect(x: 30, y: 8, width: 150, height: 14),
+                              font: .systemFont(ofSize: 10, weight: .semibold), color: menuSecondaryColor()))
+        view.addSubview(label("Loading…", frame: NSRect(x: 190, y: 8, width: 154, height: 14),
+                              font: .systemFont(ofSize: 10.5), color: menuTertiaryColor(), alignment: .right))
         return view
     }
 
@@ -2217,6 +2433,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Enable / disable a single source. sender.identifier is the kind's rawValue.
     @objc private func toggleGatewayEnabled(_ sender: NSButton) {
         guard let raw = sender.identifier?.rawValue, let kind = GatewayKind(rawValue: raw) else { return }
+        toggleGateway(kind)
+    }
+
+    private func toggleGateway(_ kind: GatewayKind) {
         let nowOn = !gatewayEnabled(kind)
         setGatewayEnabled(kind, nowOn)
         if nowOn {
@@ -2348,13 +2568,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let petSources = enabledGateways().filter { PetCatalog.petEnabled(forKey: $0.rawValue) }
         if petSources.isEmpty { return [] }
 
-        if needsLogin {
-            let name = petSources.map { sourceName($0) }.joined(separator: " / ")
-            return [PetTile(instance: Self.needsLoginPlaceholder(gateway: name),
-                            pet: PetCatalog.selected(forKey: petSources[0].rawValue),
-                            sourceKey: petSources[0].rawValue)]
-        }
-
         // ONE pet per source. It shows a dot ONLY for each session that's actively
         // RUNNING, in that session's provider colour. When a session finishes its
         // dot simply disappears — no lingering checkmark — and when nothing is
@@ -2362,6 +2575,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var tiles: [PetTile] = []
         for kind in petSources {
             let pet = PetCatalog.selected(forKey: kind.rawValue)
+            // While a source is still ACTIVATING (just switched on, fetching its
+            // first data) show NO pet at all — not even the error pet. The pet only
+            // appears once loading is DONE: the idle/working pet if it connected, or
+            // the error pet if it came back disconnected (e.g. Hermes Desktop not
+            // signed in).
+            if activating.contains(kind) { continue }
             let connected = sources.first { $0.kind == kind }?.connected ?? false
             if !connected {
                 tiles.append(PetTile(instance: Self.needsLoginPlaceholder(gateway: sourceName(kind)), pet: pet, sourceKey: kind.rawValue))
@@ -2845,9 +3064,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refresh() {
         guard !refreshing else { return }
         refreshing = true
+        let kinds = enabledGateways()   // fetch EVERY enabled source
+        // A source with no data yet is LOADING — mark it activating so its pet stays
+        // hidden (and its section shows a loading row) until data lands, instead of
+        // flashing the "error" pet during the first fetch. Sources that already have
+        // data keep their pet through a periodic refresh.
+        for kind in kinds where !sources.contains(where: { $0.kind == kind }) {
+            activating.insert(kind)
+        }
         updateStatusItem()
         rebuildMenu()
-        let kinds = enabledGateways()   // fetch EVERY enabled source
+        updateActivityPets()   // reflect the hidden pet immediately
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let desktop = Self.fetchDesktopStatus()
             let results: [(kind: GatewayKind, result: Result<QuotaPayload, Error>)] =
