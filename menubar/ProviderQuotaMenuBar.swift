@@ -1158,11 +1158,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.setAccessibilityLabel("Provider quota status")
     }
 
-    private func label(_ text: String, frame: NSRect, font: NSFont, color: NSColor = .labelColor, alignment: NSTextAlignment = .left) -> NSTextField {
+    // `color: nil` → the theme-aware PRIMARY colour (explicit dark grey in a light
+    // theme, so text never renders light-on-light regardless of appearance cascade).
+    private func label(_ text: String, frame: NSRect, font: NSFont, color: NSColor? = nil, alignment: NSTextAlignment = .left) -> NSTextField {
         let field = NSTextField(labelWithString: text)
         field.frame = frame
         field.font = font
-        field.textColor = color
+        field.textColor = color ?? menuPrimaryColor()
         field.alignment = alignment
         field.lineBreakMode = .byTruncatingTail
         return field
@@ -1181,7 +1183,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.forcedAppearance = themedAppearance()
         view.appearance = themedAppearance()
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.clear.cgColor
+        view.layer?.backgroundColor = (themedRowBackground() ?? .clear).cgColor
         return view
     }
 
@@ -1193,7 +1195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func titleView() -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 68))
-        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold)))
+        view.addSubview(label("Provider Quotas", frame: NSRect(x: 16, y: 39, width: 230, height: 20), font: .systemFont(ofSize: 15, weight: .semibold), color: menuPrimaryColor()))
         let connection = connectionSummary()
         view.addSubview(label(connection, frame: NSRect(x: 16, y: 20, width: 300, height: 17), font: .systemFont(ofSize: 11, weight: .medium), color: anyConnected ? .hermesGreen : .hermesRed))
         let generatedAt = sources.compactMap { $0.generatedAt }.first
@@ -1817,7 +1819,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // the quota is low so it stands out.
         let low = window.remainingPercent.map { $0 <= 15 } ?? false
         let bar = hasValue ? barColor(for: provider, remainingPercent: window.remainingPercent) : NSColor.tertiaryLabelColor
-        let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : NSColor.labelColor) : NSColor.tertiaryLabelColor
+        let valueColor: NSColor = hasValue ? (window.limitReached ? NSColor.hermesRed : low ? NSColor.hermesOrange : menuPrimaryColor()) : menuTertiaryColor()
         view.addSubview(label(window.label, frame: NSRect(x: 28, y: 40, width: 170, height: 18), font: .systemFont(ofSize: 12, weight: .medium)))
         let displayValue: String
         if let amount = window.remainingAmount {
@@ -1851,7 +1853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             subtitle = "No reset time reported"
         }
-        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(subtitle, frame: NSRect(x: 28, y: 4, width: 312, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
     }
 
@@ -1859,15 +1861,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 25))
         let image = NSImageView(frame: NSRect(x: 28, y: 6, width: 12, height: 12))
         image.image = NSImage(systemSymbolName: "creditcard", accessibilityDescription: nil)
-        image.contentTintColor = .tertiaryLabelColor
+        image.contentTintColor = menuTertiaryColor()
         view.addSubview(image)
-        view.addSubview(label(detail, frame: NSRect(x: 47, y: 4, width: 293, height: 17), font: .systemFont(ofSize: 10.5), color: .secondaryLabelColor))
+        view.addSubview(label(detail, frame: NSRect(x: 47, y: 4, width: 293, height: 17), font: .systemFont(ofSize: 10.5), color: menuSecondaryColor()))
         return view
     }
 
-    private func messageView(_ message: String, color: NSColor = .secondaryLabelColor) -> NSView {
+    private func messageView(_ message: String, color: NSColor? = nil) -> NSView {
         let view = menuMaterialView(NSRect(x: 0, y: 0, width: 360, height: 30))
-        view.addSubview(label(message, frame: NSRect(x: 28, y: 6, width: 312, height: 18), font: .systemFont(ofSize: 11), color: color))
+        view.addSubview(label(message, frame: NSRect(x: 28, y: 6, width: 312, height: 18), font: .systemFont(ofSize: 11), color: color ?? menuSecondaryColor()))
         return view
     }
 
@@ -1884,7 +1886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ? "Not signed in — sign in to see quotas"
             : "Sign in to your local providers to see quotas"
         view.addSubview(label(msg, frame: NSRect(x: 54, y: 15, width: 196, height: 15),
-                              font: .systemFont(ofSize: 11), color: .secondaryLabelColor))
+                              font: .systemFont(ofSize: 11), color: menuSecondaryColor()))
         if source.kind == .hermes {
             let btn = textActionButton("Sign in", action: #selector(signInGateway), glowColor: .hermesGreen)
             btn.frame = NSRect(x: 258, y: 9, width: 88, height: 26)
@@ -1976,7 +1978,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         view.addSubview(box)
         view.addSubview(label(sourceName(kind), frame: NSRect(x: 66, y: 6, width: 180, height: 16),
                               font: .systemFont(ofSize: 12, weight: on ? .medium : .regular),
-                              color: on ? .labelColor : menuSecondaryColor()))
+                              color: on ? menuPrimaryColor() : menuSecondaryColor()))
         if on {
             let connected = sources.first { $0.kind == kind }?.connected ?? false
             let dot = NSImageView(frame: NSRect(x: 322, y: 9, width: 9, height: 9))
@@ -2035,10 +2037,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // Muted text roles, darkened for a light theme so they stay legible on the
-    // translucent background (unchanged — native greys — in dark).
-    private func menuSecondaryColor() -> NSColor { isLightTheme ? NSColor.labelColor.withAlphaComponent(0.72) : .secondaryLabelColor }
-    private func menuTertiaryColor() -> NSColor { isLightTheme ? NSColor.labelColor.withAlphaComponent(0.55) : .tertiaryLabelColor }
+    // Explicit text colours for a light theme, so readability never depends on
+    // semantic-colour resolution (which could render light-on-light). Fixed dark
+    // greys on the soft light background; native greys in dark.
+    private func menuPrimaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.13, alpha: 1) : .labelColor }
+    private func menuSecondaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.26, green: 0.26, blue: 0.29, alpha: 1) : .secondaryLabelColor }
+    private func menuTertiaryColor() -> NSColor { isLightTheme ? NSColor(srgbRed: 0.40, green: 0.40, blue: 0.43, alpha: 1) : .tertiaryLabelColor }
+
+    // Row background for a forced theme. LIGHT gets a SOFT light-grey — not the harsh
+    // bright-white native light vibrancy the user found too bright — lightly
+    // translucent so it still reads as a frosted menu. DARK / System paint nothing
+    // (transparent → the native, seamless dark frosted vibrancy).
+    private func themedRowBackground() -> NSColor? {
+        appAppearanceMode == "light" ? NSColor(srgbRed: 0.90, green: 0.90, blue: 0.925, alpha: 0.94) : nil
+    }
 
     // Push the forced theme onto the live menu window (shared by all item views) so
     // its border/margins match the repainted rows. Best-effort; async catches the
@@ -2310,7 +2322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         spinner.startAnimation(nil)
         view.addSubview(spinner)
         view.addSubview(label("Activating \(name)…", frame: NSRect(x: 38, y: 8, width: 280, height: 14),
-                              font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor))
+                              font: .systemFont(ofSize: 11, weight: .medium), color: menuSecondaryColor()))
         return view
     }
 
