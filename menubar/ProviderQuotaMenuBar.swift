@@ -1128,6 +1128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         rebuildMenu()
+        applyMenuWindowAppearance()   // theme the dropdown to match the forced mode
         refreshDesktopStatus()
         syncPetsFromGateway()  // reflect a pet installed since the last open
     }
@@ -1162,7 +1163,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // clean translucent surface.
         let view = NSView(frame: frame)
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.clear.cgColor
+        // System mode → transparent (native vibrancy shows through). A forced theme
+        // → set the view's appearance (so semantic colours resolve for it) and
+        // paint an opaque themed background, since the native menu vibrancy can't be
+        // re-themed app-only.
+        if let bg = themedMenuBackgroundColor() {
+            view.appearance = themedAppearance()
+            view.layer?.backgroundColor = bg.cgColor
+        } else {
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+        }
         return view
     }
 
@@ -1954,6 +1964,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // The NSAppearance the app theme forces (nil = follow the system). A status-bar
+    // NSMenu renders in the SYSTEM appearance regardless of NSApp.appearance, so we
+    // also (a) override the menu window's appearance as it opens and (b) paint each
+    // row an opaque themed background — together they re-theme the dropdown.
+    private func themedAppearance() -> NSAppearance? {
+        switch appAppearanceMode {
+        case "light": return NSAppearance(named: .aqua)
+        case "dark":  return NSAppearance(named: .darkAqua)
+        default:      return nil
+        }
+    }
+
+    // Opaque menu background for a forced theme (nil in System mode → keep the
+    // native vibrancy). Flat colours, so tiling rows stay seamless (no banding).
+    private func themedMenuBackgroundColor() -> NSColor? {
+        switch appAppearanceMode {
+        case "light": return NSColor(srgbRed: 0.965, green: 0.965, blue: 0.972, alpha: 1)
+        case "dark":  return NSColor(srgbRed: 0.149, green: 0.149, blue: 0.157, alpha: 1)
+        default:      return nil
+        }
+    }
+
+    // Push the forced theme onto the live menu window (shared by all item views) so
+    // its border/margins match the repainted rows. Best-effort; async catches the
+    // window once AppKit has created it for display.
+    private func applyMenuWindowAppearance() {
+        let appearance = themedAppearance()
+        let assign: () -> Void = { [weak menu] in
+            if let window = menu?.items.lazy.compactMap({ $0.view?.window }).first {
+                window.appearance = appearance
+            }
+        }
+        assign()
+        DispatchQueue.main.async(execute: assign)
+    }
+
     // Icon + tooltip reflect the CURRENT mode (and what a click switches to). The
     // cycle is System → Light → Dark → System, so "System" stays reachable.
     private func appearanceSymbolName() -> String {
@@ -1981,6 +2027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         applyAppearance()
         updateStatusItem()
         rebuildMenu()
+        applyMenuWindowAppearance()   // retheme the open dropdown live
         updateActivityPets()
     }
 
