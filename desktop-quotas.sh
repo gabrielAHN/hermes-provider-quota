@@ -229,28 +229,95 @@ if ENDPOINT == "--activity":
     out = []
     status_busy = False
     act = _soft(get_json)("/api/plugins/provider-quota/activity") or {}
+
+    # The /activity endpoint only reports is_active (no turn state). The core session
+    # store (/api/sessions) carries a human-readable `last_activity_description` per
+    # session — e.g. "tool running: clarify" while an agent is asking YOU to clarify.
+    # Join by session_id to detect the WAITING-FOR-YOU states without a gateway change.
+    store_by_id = {}
+    try:
+        _sess = _soft(get_json)("/api/sessions") or {}
+        for _s in (_sess.get("sessions") or []):
+            _sid = _s.get("session_id") or _s.get("id")
+            if _sid:
+                store_by_id[str(_sid)] = _s
+    except Exception:
+        pass
+
+    def _store(sess):
+        return store_by_id.get(str(sess.get("session_id") or ""), {})
+
+    # Tools whose "tool running: <name>" means the agent is blocked on YOU.
+    # (Kept specific to avoid false positives like read_input_file / ask_database.)
+    _INPUT_TOOLS = ("clarify", "ask_user", "askuser", "ask_followup", "ask_question",
+                    "request_input", "user_input", "get_input", "elicit", "prompt_user")
+    _PERM_TOOLS = ("request_permission", "ask_permission", "approve", "approval",
+                   "permission", "confirm_action", "authorize")
+    _INPUT_PHRASES = ("waiting for input", "awaiting input", "needs input", "input needed",
+                      "awaiting your response", "waiting for you", "awaiting user")
+    _PERM_PHRASES = ("permission", "approval", "awaiting approval", "needs approval",
+                     "awaiting your approval", "permission required")
+
+    def _attention(sess):
+        # Explicit gateway flags win if the gateway ever reports them.
+        if any(sess.get(k) is True for k in ("needs_permission", "awaiting_approval", "permission_required")):
+            return "permission"
+        if any(sess.get(k) is True for k in ("needs_input", "awaiting_input", "input_required")):
+            return "input"
+        st = str(sess.get("state") or sess.get("status") or "").lower()
+        if st in ("permission", "awaiting_approval", "approval", "needs_permission"):
+            return "permission"
+        if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
+            return "input"
+        # Else derive from the session store's activity description. The store uses
+        # a few prefixes for the same idea ("tool running: X" / "executing tool: X" /
+        # "running tool: X"), so extract the tool name from any of them.
+        d = str(_store(sess).get("last_activity_description") or "").lower()
+        tool = ""
+        for _p in ("tool running:", "executing tool:", "running tool:", "calling tool:", "tool:"):
+            if _p in d:
+                tool = d.split(_p, 1)[1].strip()
+                break
+        if any(p in d for p in _PERM_PHRASES) or any(tool == t or tool.startswith(t) for t in _PERM_TOOLS):
+            return "permission"
+        if any(p in d for p in _INPUT_PHRASES) or any(tool == t or tool.startswith(t) for t in _INPUT_TOOLS):
+            return "input"
+        return ""
+
     for s in act.get("sessions") or []:
         active = bool(s.get("is_active"))
-        if active:
+        att = _attention(s)
+        # A session waiting for you counts as ATTENTION, not "busy" — don't let it set
+        # the aggregate busy flag (the pet should wave, not read as working).
+        if active and att == "":
             status_busy = True
-        # A session can run MULTIPLE models — resolve each to its provider family
-        # (distinct, in order) so the pet draws one dot split into a wedge per
-        # model. Fall back to the single resolved provider when there's just one.
+        # Colour by the LIVE model. Prefer the AUTHORITATIVE session store's current
+        # `model` (the /activity plugin's model resolution can lag — it reported
+        # anthropic while the live model was codex). Then the plugin's models list,
+        # then billing/provider. A multi-model session still splits into a wedge per
+        # distinct family.
+        st = _store(s)
+        if st.get("model") or st.get("models"):
+            model_list = ([st["model"]] if st.get("model") else []) + (st.get("models") or [])
+        else:
+            model_list = s.get("models") or []
         families = []
-        for m in (s.get("models") or []):
+        for m in model_list:
             fam = _dot_provider({"model": m})
             if fam and fam not in families:
                 families.append(fam)
         if not families:
-            fam = _dot_provider(s)
+            fam = _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s)
             families = [fam] if fam else []
         out.append({
             "is_active": active,
             "ended_at": s.get("ended_at"),
             "last_active": time.time() if active else s.get("last_active"),
-            "billing_provider": _dot_provider(s),
-            "provider": s.get("provider"),
+            "billing_provider": _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s),
+            "provider": st.get("provider") or s.get("provider"),
             "providers": families,
+            "needs_input": att == "input",
+            "needs_permission": att == "permission",
         })
     emit(json.dumps({"agents": 0, "status_busy": status_busy, "sessions": out}).encode())
     sys.exit(0)

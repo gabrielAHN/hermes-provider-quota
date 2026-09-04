@@ -301,6 +301,12 @@ struct PetInfo: Equatable {
 struct SessionMark: Equatable {
     let hex: String     // provider colour
     let busy: Bool      // actively processing (bright pulse) vs idle (dim)
+    // The gateway flagged this session as WAITING FOR YOU. `needsInput` = a plain
+    // input prompt; `needsPermission` = a permission / approval prompt. Either draws
+    // an attention badge on the point and makes the pet WAVE — never the error
+    // animation, since it isn't an error. Permission takes visual priority.
+    var needsInput: Bool = false
+    var needsPermission: Bool = false
 }
 
 struct PetTile: Equatable {
@@ -710,7 +716,7 @@ final class ActivityPetsView: NSView {
             let row: Int
             switch instance.status {
             case "working":            row = 7   // running → actively working
-            case "waiting":            row = 6   // waiting → needs your input
+            case "waiting":            row = 3   // needs your input → WAVE for attention
             case "error", "failed":    row = 5   // failed → in trouble
             case "completed":
                 // celebrate (jump) briefly, then settle back to idle
@@ -755,7 +761,10 @@ final class ActivityPetsView: NSView {
         let petRect = NSRect(x: tileRect.minX + 2, y: tileRect.minY + 16, width: 52, height: 56.3)
         let halo = NSBezierPath(ovalIn: NSRect(x: petRect.minX + 4, y: petRect.minY + 5, width: petRect.width - 8, height: petRect.height - 10))
         // Hermes blue is the primary halo accent; status recolours it.
-        let haloColor: NSColor = failed ? .hermesRed : instance.status == "waiting" ? .hermesOrange : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
+        // "waiting" (needs-your-input) deliberately keeps the NORMAL halo — the pet
+        // signals input only by WAVING (drawNukey row 3), never with a pet badge/tint;
+        // the input badge lives on the session point instead.
+        let haloColor: NSColor = failed ? .hermesRed : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
         let haloPulse = CGFloat((sin(Double(phase) * .pi / 6) + 1) * 0.035)
         haloColor.withAlphaComponent((working || failed ? 0.17 : 0.09) + haloPulse).setFill()
         halo.fill()
@@ -776,7 +785,7 @@ final class ActivityPetsView: NSView {
             let padX: CGFloat = 2         // capsule padding — a tight circle around one dot
             let capH: CGFloat = 10        // capsule height — hug the dots so the glow sits close
             let cy = tileRect.minY + 10   // clear of the bottom edge so the (bigger) glow isn't clipped
-            var groups: [(colors: [(NSColor, String)], busy: Bool)] = []
+            var groups: [(colors: [(NSColor, String)], busy: Bool, needsInput: Bool, needsPermission: Bool)] = []
             var total = 0
             for mark in tile.sessions {
                 var pairs = mark.hex.split(separator: ",").compactMap { part -> (NSColor, String)? in
@@ -785,7 +794,7 @@ final class ActivityPetsView: NSView {
                 }
                 if pairs.isEmpty { pairs = [(.hermesBlue, "")] }
                 if !groups.isEmpty && total + pairs.count > 7 { break }
-                groups.append((pairs, mark.busy))
+                groups.append((pairs, mark.busy, mark.needsInput, mark.needsPermission))
                 total += pairs.count
                 if total >= 7 { break }
             }
@@ -803,6 +812,45 @@ final class ActivityPetsView: NSView {
             }()
             let rowW = capsTotal + CGFloat(max(0, groups.count - 1)) * sessionGap
             var cx0 = tileRect.midX - rowW / 2   // left edge of the first capsule
+            // Small orange "input" badge at a point's top-right (waiting for you) —
+            // sits mostly OUTSIDE the point so its own colour still shows.
+            // A "needs you" ICON at the point's TOP-RIGHT (no ring) — same amber chip
+            // across ALL providers so it reads consistently, with a thin dark rim so
+            // it pops on any point colour. Shape says which kind: a caret for input.
+            func drawInputBadge(_ dotRect: NSRect) {
+                let bd: CGFloat = 7
+                let br = NSRect(x: dotRect.maxX - 2.4, y: dotRect.maxY - 2.4, width: bd, height: bd)
+                NSColor.black.withAlphaComponent(0.35).setStroke()
+                let rim = NSBezierPath(ovalIn: br.insetBy(dx: -0.5, dy: -0.5)); rim.lineWidth = 1; rim.stroke()
+                NSColor.hermesYellow.setFill()
+                NSBezierPath(ovalIn: br).fill()
+                NSColor.white.withAlphaComponent(0.95).setStroke()
+                let outline = NSBezierPath(ovalIn: br); outline.lineWidth = 0.7; outline.stroke()
+                // white input caret (text cursor) — "your turn".
+                NSColor.white.setFill()
+                NSBezierPath(roundedRect: NSRect(x: br.midX - 0.65, y: br.midY - 2, width: 1.3, height: 4),
+                             xRadius: 0.65, yRadius: 0.65).fill()
+            }
+            // Permission / approval prompt — the SAME amber chip, but a white LOCK.
+            func drawPermissionBadge(_ dotRect: NSRect) {
+                let bd: CGFloat = 7
+                let br = NSRect(x: dotRect.maxX - 2.4, y: dotRect.maxY - 2.4, width: bd, height: bd)
+                NSColor.black.withAlphaComponent(0.35).setStroke()
+                let rim = NSBezierPath(ovalIn: br.insetBy(dx: -0.5, dy: -0.5)); rim.lineWidth = 1; rim.stroke()
+                NSColor.hermesYellow.setFill()
+                NSBezierPath(ovalIn: br).fill()
+                NSColor.white.withAlphaComponent(0.95).setStroke()
+                let outline = NSBezierPath(ovalIn: br); outline.lineWidth = 0.7; outline.stroke()
+                // mini lock: a white body + a thin white shackle arc on top.
+                NSColor.white.setFill()
+                let body = NSRect(x: br.midX - 1.5, y: br.minY + 1.7, width: 3, height: 2.2)
+                NSBezierPath(roundedRect: body, xRadius: 0.6, yRadius: 0.6).fill()
+                NSColor.white.setStroke()
+                let shackle = NSBezierPath()
+                shackle.appendArc(withCenter: NSPoint(x: br.midX, y: body.maxY), radius: 0.95, startAngle: 0, endAngle: 180)
+                shackle.lineWidth = 0.6
+                shackle.stroke()
+            }
             for (gi, group) in groups.enumerated() {
                 let w = capW(group.colors.count)
                 // "Running" glows the WHOLE session capsule in sync and ENLARGES it on
@@ -834,6 +882,10 @@ final class ActivityPetsView: NSView {
                         NSColor.hermesRed.setStroke()
                         ring.lineWidth = 1.4
                         ring.stroke()
+                        // Still flag "needs you" even when the provider is out of
+                        // quota (the red ring stays; add the attention badge).
+                        if group.needsPermission { drawPermissionBadge(dotRect) }
+                        else if group.needsInput { drawInputBadge(dotRect) }
                         dx += dotSize + innerGap
                         continue
                     }
@@ -857,23 +909,27 @@ final class ActivityPetsView: NSView {
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
+                    if group.needsPermission { drawPermissionBadge(dotRect) }
+                    else if group.needsInput { drawInputBadge(dotRect) }
                     dx += dotSize + innerGap
                 }
                 cx0 += w + sessionGap
             }
         }
 
-        // Status badge, top-right (kept clear of the bottom dots row).
-        if instance.status == "waiting" || failed {
+        // Status badge, top-right (kept clear of the bottom dots row). ONLY the error
+        // ("!") state badges the pet — "needs your input" is shown by the pet WAVING
+        // plus the input badge on the session point, never a pet badge.
+        if failed {
             let pulse = CGFloat((sin(Double(phase) * .pi / 4) + 1) * 1.2)
             let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16 - pulse / 2, y: tileRect.maxY - 16 - pulse / 2, width: 14 + pulse, height: 14 + pulse))
-            (failed ? NSColor.hermesRed : NSColor.hermesOrange).setFill()
+            NSColor.hermesRed.setFill()
             badge.fill()
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 9, weight: .bold),
                 .foregroundColor: NSColor.white
             ]
-            NSAttributedString(string: failed ? "!" : "?", attributes: attributes).draw(at: NSPoint(x: tileRect.maxX - (failed ? 10.6 : 12.3), y: tileRect.maxY - 14.6))
+            NSAttributedString(string: "!", attributes: attributes).draw(at: NSPoint(x: tileRect.maxX - 10.6, y: tileRect.maxY - 14.6))
         } else if instance.completed {
             let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16, y: tileRect.maxY - 16, width: 14, height: 14))
             NSColor.hermesGreen.setFill()
@@ -1068,6 +1124,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Provider colour (hex) per ACTIVE Hermes session, so its dots match the real
     // provider (e.g. OpenRouter purple) instead of a generic gateway colour.
     private var hermesSessionHexes: [String] = []
+    // Provider colour (hex) per Hermes session the gateway flagged as WAITING FOR
+    // YOUR INPUT — drawn as a waiting dot with an input badge, and it makes the pet
+    // wave for attention.
+    private var hermesWaitingHexes: [String] = []
+    // Provider colour (hex) per Hermes session the gateway flagged as awaiting a
+    // PERMISSION / approval prompt — a lock badge on the point (and the pet waves).
+    private var hermesPermissionHexes: [String] = []
     // Last local session scan, cached so an eye toggle can rebuild the pet
     // synchronously (immediately) without waiting for the next 1s scan.
     private var lastLocalSessions: [LocalSession] = []
@@ -2593,24 +2656,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let hiddenColors = Set((sources.first { $0.kind == kind }?.providers ?? [])
                 .filter { !providerShownInMenuBar(kind, $0.provider) }
                 .map { Self.providerHex($0.provider).lowercased() })
-            func visibleMark(_ hex: String) -> SessionMark? {
-                guard !hiddenColors.isEmpty else { return SessionMark(hex: hex, busy: true) }
+            func visibleMark(_ hex: String, needsInput: Bool = false, needsPermission: Bool = false) -> SessionMark? {
+                let attention = needsInput || needsPermission
+                let busy = !attention   // waiting sessions aren't generating
+                // A session that NEEDS YOU (input/permission) always shows — even for a
+                // provider you've hidden — so you never miss it. Running dots still
+                // respect the eye-toggle hiding.
+                guard !attention, !hiddenColors.isEmpty else {
+                    return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission)
+                }
                 let kept = hex.split(separator: ",").map(String.init)
                     .filter { !hiddenColors.contains($0.lowercased()) }
-                return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: true)
+                return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: busy, needsInput: needsInput, needsPermission: needsPermission)
             }
 
-            let marks: [SessionMark]
+            var marks: [SessionMark]
             let title: String
             let working: Bool
             if kind == .hermes {
-                // Dots map ONLY to real running sessions (is_active). Merely being
-                // connected — or the Desktop being active while you sign in — makes
-                // the pet WORK (hermesBusy) but shows NO dots.
-                marks = hermesSessionHexes.compactMap(visibleMark)
-                title = marks.isEmpty ? "" : "\(marks.count) agent\(marks.count == 1 ? "" : "s") running"
-                working = hermesBusy || !marks.isEmpty
+                // Running sessions light a busy dot; sessions the gateway flagged as
+                // waiting get a dim dot with an attention badge — an input badge or a
+                // permission (lock) badge (see drawPet).
+                let running = hermesSessionHexes.compactMap { visibleMark($0) }
+                let waiting = hermesWaitingHexes.compactMap { visibleMark($0, needsInput: true) }
+                let permission = hermesPermissionHexes.compactMap { visibleMark($0, needsPermission: true) }
+                marks = running + waiting + permission
+                title = running.isEmpty ? "" : "\(running.count) agent\(running.count == 1 ? "" : "s") running"
+                working = hermesBusy || !running.isEmpty
             } else {
+                // Local has no gateway to report a waiting-for-input state, so its
+                // sessions are running (busy) or nothing.
                 let busy = localSessions.filter { $0.busy }   // idle/open sessions show nothing
                 marks = busy.compactMap { visibleMark($0.hex) }
                 title = "\(marks.count) session\(marks.count == 1 ? "" : "s")"
@@ -2623,11 +2698,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .filter { providerRingColor($0, connected: connected) != nil }
                 .map { Self.providerHex($0.provider).lowercased() })
 
-            // The pet moves while the source is working; otherwise it sits idle.
-            // Dots only appear for genuinely running sessions.
-            let display = working
-                ? Self.workingSourceInstance(name: sourceName(kind), title: title)
-                : Self.idleSourceInstance(name: sourceName(kind))
+            // A session waiting for you (input OR permission) makes the pet WAVE for
+            // attention (the non-error "waiting" animation), taking priority over the
+            // plain working/idle state. Otherwise it moves while working and sits idle.
+            let needsPermission = marks.contains { $0.needsPermission }
+            let needsAttention = needsPermission || marks.contains { $0.needsInput }
+            let display: ProviderActivityInstance
+            if needsAttention {
+                let n = marks.filter { $0.needsInput || $0.needsPermission }.count
+                let noun = needsPermission ? "permission" : "input"
+                display = Self.waitingSourceInstance(name: sourceName(kind),
+                    title: "\(n) session\(n == 1 ? "" : "s") need\(n == 1 ? "s" : "") your \(noun)")
+            } else if working {
+                display = Self.workingSourceInstance(name: sourceName(kind), title: title)
+            } else {
+                display = Self.idleSourceInstance(name: sourceName(kind))
+            }
             tiles.append(PetTile(instance: display, pet: pet, sessionCount: max(marks.count, 1), sessions: marks, sourceKey: kind.rawValue, alertHexes: alertHexes))
         }
         return tiles
@@ -2640,10 +2726,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // (`is_active`, or still-open and just touched), keyed off its
     // `billing_provider` — so OpenRouter shows purple, Codex green, etc. Works for
     // a REMOTE gateway, where sessions run server-side.
-    private static func fetchGatewayActivity() -> (busy: Bool, agents: Int, sessionHexes: [String]) {
+    private static func fetchGatewayActivity() -> (busy: Bool, agents: Int, sessionHexes: [String], waitingHexes: [String], permissionHexes: [String]) {
         let helper = helperPath("hermes-desktop-quotas")
         guard FileManager.default.isExecutableFile(atPath: helper) else {
-            return (false, 0, [])
+            return (false, 0, [], [], [])
         }
         // One helper call resolves the gateway once and returns /api/status plus
         // every profile's recent sessions (see desktop-quotas.sh --activity). We
@@ -2653,12 +2739,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // is plainly running in its session's flags.
         var agents = 0, statusBusy = false
         var hexes: [String] = []
+        var waitingHexes: [String] = []
+        var permissionHexes: [String] = []
         if let data = runHelper(helper, ["--activity"]),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             agents = (obj["agents"] as? Int) ?? 0
             statusBusy = (obj["status_busy"] as? Bool) ?? false
             let now = Date().timeIntervalSince1970
             for session in (obj["sessions"] as? [[String: Any]]) ?? [] {
+                // The gateway can flag a session as WAITING FOR YOU — a PERMISSION /
+                // approval prompt (priority) or a plain INPUT prompt. Either gets an
+                // attention dot + badge regardless of is_active (it isn't generating),
+                // so route it out before the "is it running?" gate below.
+                if (session["needs_permission"] as? Bool) ?? false {
+                    permissionHexes.append(Self.sessionHexes(for: session))
+                    continue
+                }
+                if (session["needs_input"] as? Bool) ?? false {
+                    waitingHexes.append(Self.sessionHexes(for: session))
+                    continue
+                }
                 // A session lights a dot while it's genuinely RUNNING.
                 //
                 // CLOSED (ended_at set) → DONE: show only for a short grace so an
@@ -2688,31 +2788,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         guard let lastActive, now - lastActive < hermesSessionFreshWindow else { continue }
                     }
                 }
-                // Colour by the SESSION's provider(s). The helper passes `providers`
-                // — the DISTINCT model families the session is running; a
-                // mixture-of-agents session runs several. Join their colours so the
-                // pet draws ONE dot per session, split into a wedge per model. Fall
-                // back to the single resolved provider (billing_provider/model) when
-                // there's just one. One (possibly multi-colour) dot per session.
-                let families = (session["providers"] as? [String])?.filter { !$0.isEmpty } ?? []
-                if !families.isEmpty {
-                    var seen = Set<String>()
-                    var hs: [String] = []
-                    for f in families {
-                        let h = sessionHex(billing: f, provider: nil, model: nil)
-                        if seen.insert(h).inserted { hs.append(h) }
-                    }
-                    hexes.append(hs.joined(separator: ","))
-                } else {
-                    hexes.append(sessionHex(
-                        billing: session["billing_provider"] as? String,
-                        provider: session["provider"] as? String,
-                        model: session["model"] as? String))
-                }
+                // Colour by the SESSION's provider(s) — one (possibly multi-colour)
+                // dot per running session (see sessionHexes(for:)).
+                hexes.append(Self.sessionHexes(for: session))
             }
         }
         let busy = statusBusy || !hexes.isEmpty
-        return (busy, agents, hexes)
+        return (busy, agents, hexes, waitingHexes, permissionHexes)
+    }
+
+    // One (possibly multi-colour, comma-joined) hex string for a gateway session —
+    // a colour per DISTINCT model family it runs (mixture-of-agents), else its
+    // single resolved provider colour.
+    private static func sessionHexes(for session: [String: Any]) -> String {
+        let families = (session["providers"] as? [String])?.filter { !$0.isEmpty } ?? []
+        if !families.isEmpty {
+            var seen = Set<String>()
+            var hs: [String] = []
+            for f in families {
+                let h = sessionHex(billing: f, provider: nil, model: nil)
+                if seen.insert(h).inserted { hs.append(h) }
+            }
+            return hs.joined(separator: ",")
+        }
+        return sessionHex(billing: session["billing_provider"] as? String,
+                          provider: session["provider"] as? String,
+                          model: session["model"] as? String)
     }
 
     // Provider colour for one gateway session. The --activity helper pre-resolves
@@ -2747,7 +2848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard !hermesPollInFlight else { return }
         hermesPollInFlight = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let (busy, agents, hexes) = Self.fetchGatewayActivity()
+            let (busy, agents, hexes, waiting, permission) = Self.fetchGatewayActivity()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.hermesPollInFlight = false
@@ -2769,10 +2870,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.hermesDotHoldUntil = Date().addingTimeInterval(Self.hermesDotHoldSeconds)
                     self.hermesHeldHexes = hexes
                 }
-                let changed = self.hermesBusy != effectiveBusy || self.hermesActiveAgents != agents || self.hermesSessionHexes != effectiveHexes
+                let changed = self.hermesBusy != effectiveBusy || self.hermesActiveAgents != agents
+                    || self.hermesSessionHexes != effectiveHexes || self.hermesWaitingHexes != waiting
+                    || self.hermesPermissionHexes != permission
                 self.hermesBusy = effectiveBusy
                 self.hermesActiveAgents = agents
                 self.hermesSessionHexes = effectiveHexes
+                self.hermesWaitingHexes = waiting
+                self.hermesPermissionHexes = permission
                 if changed { self.updateActivityPets() }
             }
         }
@@ -2810,6 +2915,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             provider: "source", providerColor: "#0053fd", providerLabel: "",
             sessionId: "", startedAt: Date().timeIntervalSince1970,
             status: "working", title: title)
+    }
+
+    // A source with a session WAITING FOR YOUR INPUT: the non-error "waiting"
+    // animation (drawNukey row 6 — a wave for attention) + orange halo, distinct
+    // from the red "failed" error state. Not an error, just "come look at me".
+    private static func waitingSourceInstance(name: String, title: String) -> ProviderActivityInstance {
+        ProviderActivityInstance(
+            completedAt: nil, key: "\(name):waiting", model: "", profile: name,
+            provider: "source", providerColor: "#db704b", providerLabel: "",
+            sessionId: "", startedAt: Date().timeIntervalSince1970,
+            status: "waiting", title: title)
     }
 
     // Seconds since a session's log was last written before we treat it as idle.
