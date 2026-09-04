@@ -714,7 +714,7 @@ final class ActivityPetsView: NSView {
             let row: Int
             switch instance.status {
             case "working":            row = 7   // running → actively working
-            case "waiting":            row = 6   // waiting → needs your input
+            case "waiting":            row = 3   // needs your input → WAVE for attention
             case "error", "failed":    row = 5   // failed → in trouble
             case "completed":
                 // celebrate (jump) briefly, then settle back to idle
@@ -759,7 +759,10 @@ final class ActivityPetsView: NSView {
         let petRect = NSRect(x: tileRect.minX + 2, y: tileRect.minY + 16, width: 52, height: 56.3)
         let halo = NSBezierPath(ovalIn: NSRect(x: petRect.minX + 4, y: petRect.minY + 5, width: petRect.width - 8, height: petRect.height - 10))
         // Hermes blue is the primary halo accent; status recolours it.
-        let haloColor: NSColor = failed ? .hermesRed : instance.status == "waiting" ? .hermesOrange : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
+        // "waiting" (needs-your-input) deliberately keeps the NORMAL halo — the pet
+        // signals input only by WAVING (drawNukey row 3), never with a pet badge/tint;
+        // the input badge lives on the session point instead.
+        let haloColor: NSColor = failed ? .hermesRed : instance.completed ? .hermesGreen : working ? .hermesBlue : .hermesBlue
         let haloPulse = CGFloat((sin(Double(phase) * .pi / 6) + 1) * 0.035)
         haloColor.withAlphaComponent((working || failed ? 0.17 : 0.09) + haloPulse).setFill()
         halo.fill()
@@ -897,17 +900,19 @@ final class ActivityPetsView: NSView {
             }
         }
 
-        // Status badge, top-right (kept clear of the bottom dots row).
-        if instance.status == "waiting" || failed {
+        // Status badge, top-right (kept clear of the bottom dots row). ONLY the error
+        // ("!") state badges the pet — "needs your input" is shown by the pet WAVING
+        // plus the input badge on the session point, never a pet badge.
+        if failed {
             let pulse = CGFloat((sin(Double(phase) * .pi / 4) + 1) * 1.2)
             let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16 - pulse / 2, y: tileRect.maxY - 16 - pulse / 2, width: 14 + pulse, height: 14 + pulse))
-            (failed ? NSColor.hermesRed : NSColor.hermesOrange).setFill()
+            NSColor.hermesRed.setFill()
             badge.fill()
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 9, weight: .bold),
                 .foregroundColor: NSColor.white
             ]
-            NSAttributedString(string: failed ? "!" : "?", attributes: attributes).draw(at: NSPoint(x: tileRect.maxX - (failed ? 10.6 : 12.3), y: tileRect.maxY - 14.6))
+            NSAttributedString(string: "!", attributes: attributes).draw(at: NSPoint(x: tileRect.maxX - 10.6, y: tileRect.maxY - 14.6))
         } else if instance.completed {
             let badge = NSBezierPath(ovalIn: NSRect(x: tileRect.maxX - 16, y: tileRect.maxY - 16, width: 14, height: 14))
             NSColor.hermesGreen.setFill()
