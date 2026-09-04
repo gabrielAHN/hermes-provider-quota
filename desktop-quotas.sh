@@ -229,13 +229,61 @@ if ENDPOINT == "--activity":
     out = []
     status_busy = False
     act = _soft(get_json)("/api/plugins/provider-quota/activity") or {}
+
+    # The /activity endpoint only reports is_active (no turn state). The core session
+    # store (/api/sessions) carries a human-readable `last_activity_description` per
+    # session — e.g. "tool running: clarify" while an agent is asking YOU to clarify.
+    # Join by session_id to detect the WAITING-FOR-YOU states without a gateway change.
+    desc_by_id = {}
+    try:
+        _sess = _soft(get_json)("/api/sessions") or {}
+        for _s in (_sess.get("sessions") or []):
+            _sid = _s.get("session_id") or _s.get("id")
+            if _sid:
+                desc_by_id[str(_sid)] = str(_s.get("last_activity_description") or "").lower()
+    except Exception:
+        pass
+
+    # Tools whose "tool running: <name>" means the agent is blocked on YOU.
+    # (Kept specific to avoid false positives like read_input_file / ask_database.)
+    _INPUT_TOOLS = ("clarify", "ask_user", "askuser", "ask_followup", "ask_question",
+                    "request_input", "user_input", "get_input", "elicit", "prompt_user")
+    _PERM_TOOLS = ("request_permission", "ask_permission", "approve", "approval",
+                   "permission", "confirm_action", "authorize")
+    _INPUT_PHRASES = ("waiting for input", "awaiting input", "needs input", "input needed",
+                      "awaiting your response", "waiting for you", "awaiting user")
+    _PERM_PHRASES = ("permission", "approval", "awaiting approval", "needs approval",
+                     "awaiting your approval", "permission required")
+
+    def _attention(sess):
+        # Explicit gateway flags win if the gateway ever reports them.
+        if any(sess.get(k) is True for k in ("needs_permission", "awaiting_approval", "permission_required")):
+            return "permission"
+        if any(sess.get(k) is True for k in ("needs_input", "awaiting_input", "input_required")):
+            return "input"
+        st = str(sess.get("state") or sess.get("status") or "").lower()
+        if st in ("permission", "awaiting_approval", "approval", "needs_permission"):
+            return "permission"
+        if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
+            return "input"
+        # Else derive from the session store's activity description.
+        d = desc_by_id.get(str(sess.get("session_id") or ""), "")
+        tool = d.split("tool running:", 1)[1].strip() if "tool running:" in d else ""
+        if any(p in d for p in _PERM_PHRASES) or any(tool == t or tool.startswith(t) for t in _PERM_TOOLS):
+            return "permission"
+        if any(p in d for p in _INPUT_PHRASES) or any(tool == t or tool.startswith(t) for t in _INPUT_TOOLS):
+            return "input"
+        return ""
+
     for s in act.get("sessions") or []:
         active = bool(s.get("is_active"))
-        if active:
+        att = _attention(s)
+        # A session waiting for you counts as ATTENTION, not "busy" — don't let it set
+        # the aggregate busy flag (the pet should wave, not read as working).
+        if active and att == "":
             status_busy = True
         # A session can run MULTIPLE models — resolve each to its provider family
-        # (distinct, in order) so the pet draws one dot split into a wedge per
-        # model. Fall back to the single resolved provider when there's just one.
+        # (distinct, in order) so the pet draws one dot split into a wedge per model.
         families = []
         for m in (s.get("models") or []):
             fam = _dot_provider({"model": m})
@@ -244,30 +292,6 @@ if ENDPOINT == "--activity":
         if not families:
             fam = _dot_provider(s)
             families = [fam] if fam else []
-        # Forward WAITING-FOR-YOU flags if the gateway reports them, so the menu-bar
-        # can badge the session point + wave the pet. Two kinds: a PERMISSION /
-        # approval prompt, and a plain INPUT prompt. Accept a few likely field names
-        # / a status string; default False so there's no false positive when the
-        # gateway doesn't report it.
-        def _flag(sess, keys, states):
-            for k in keys:
-                v = sess.get(k)
-                if isinstance(v, bool) and v:
-                    return True
-            st = str(sess.get("state") or sess.get("status") or "").lower()
-            return st in states
-        needs_permission = _flag(
-            s,
-            ("needs_permission", "awaiting_approval", "awaiting_permission",
-             "permission_required", "needsPermission", "approval_required"),
-            ("permission", "awaiting_approval", "awaiting_permission",
-             "permission_required", "approval", "needs_permission"))
-        needs_input = _flag(
-            s,
-            ("needs_input", "waiting_for_input", "awaiting_input",
-             "awaiting_response", "needsInput", "input_required"),
-            ("waiting", "awaiting_input", "needs_input",
-             "input_required", "waiting_for_input", "awaiting_response"))
         out.append({
             "is_active": active,
             "ended_at": s.get("ended_at"),
@@ -275,8 +299,8 @@ if ENDPOINT == "--activity":
             "billing_provider": _dot_provider(s),
             "provider": s.get("provider"),
             "providers": families,
-            "needs_input": needs_input,
-            "needs_permission": needs_permission,
+            "needs_input": att == "input",
+            "needs_permission": att == "permission",
         })
     emit(json.dumps({"agents": 0, "status_busy": status_busy, "sessions": out}).encode())
     sys.exit(0)

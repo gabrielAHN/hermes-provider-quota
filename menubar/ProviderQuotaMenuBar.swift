@@ -814,29 +814,33 @@ final class ActivityPetsView: NSView {
             var cx0 = tileRect.midX - rowW / 2   // left edge of the first capsule
             // Small orange "input" badge at a point's top-right (waiting for you) —
             // sits mostly OUTSIDE the point so its own colour still shows.
+            // A "needs you" ICON at the point's TOP-RIGHT (no ring) — same amber chip
+            // across ALL providers so it reads consistently, with a thin dark rim so
+            // it pops on any point colour. Shape says which kind: a caret for input.
             func drawInputBadge(_ dotRect: NSRect) {
-                let bd: CGFloat = 5.5
-                let br = NSRect(x: dotRect.maxX - 1.8, y: dotRect.maxY - 1.8, width: bd, height: bd)
-                NSColor.hermesOrange.setFill()
-                NSBezierPath(ovalIn: br).fill()
-                NSColor.white.withAlphaComponent(0.95).setStroke()
-                let outline = NSBezierPath(ovalIn: br)
-                outline.lineWidth = 0.7
-                outline.stroke()
-                NSColor.white.setFill()
-                NSBezierPath(ovalIn: br.insetBy(dx: 1.7, dy: 1.7)).fill()   // tiny white centre
-            }
-            // Permission / approval prompt — an AMBER corner badge with a tiny white
-            // LOCK, distinct from the (orange, plain-dot) input badge.
-            func drawPermissionBadge(_ dotRect: NSRect) {
                 let bd: CGFloat = 7
                 let br = NSRect(x: dotRect.maxX - 2.4, y: dotRect.maxY - 2.4, width: bd, height: bd)
+                NSColor.black.withAlphaComponent(0.35).setStroke()
+                let rim = NSBezierPath(ovalIn: br.insetBy(dx: -0.5, dy: -0.5)); rim.lineWidth = 1; rim.stroke()
                 NSColor.hermesYellow.setFill()
                 NSBezierPath(ovalIn: br).fill()
                 NSColor.white.withAlphaComponent(0.95).setStroke()
-                let outline = NSBezierPath(ovalIn: br)
-                outline.lineWidth = 0.7
-                outline.stroke()
+                let outline = NSBezierPath(ovalIn: br); outline.lineWidth = 0.7; outline.stroke()
+                // white input caret (text cursor) — "your turn".
+                NSColor.white.setFill()
+                NSBezierPath(roundedRect: NSRect(x: br.midX - 0.65, y: br.midY - 2, width: 1.3, height: 4),
+                             xRadius: 0.65, yRadius: 0.65).fill()
+            }
+            // Permission / approval prompt — the SAME amber chip, but a white LOCK.
+            func drawPermissionBadge(_ dotRect: NSRect) {
+                let bd: CGFloat = 7
+                let br = NSRect(x: dotRect.maxX - 2.4, y: dotRect.maxY - 2.4, width: bd, height: bd)
+                NSColor.black.withAlphaComponent(0.35).setStroke()
+                let rim = NSBezierPath(ovalIn: br.insetBy(dx: -0.5, dy: -0.5)); rim.lineWidth = 1; rim.stroke()
+                NSColor.hermesYellow.setFill()
+                NSBezierPath(ovalIn: br).fill()
+                NSColor.white.withAlphaComponent(0.95).setStroke()
+                let outline = NSBezierPath(ovalIn: br); outline.lineWidth = 0.7; outline.stroke()
                 // mini lock: a white body + a thin white shackle arc on top.
                 NSColor.white.setFill()
                 let body = NSRect(x: br.midX - 1.5, y: br.minY + 1.7, width: 3, height: 2.2)
@@ -905,19 +909,8 @@ final class ActivityPetsView: NSView {
                     NSColor.white.withAlphaComponent(0.85).setStroke()
                     dot.lineWidth = 0.75
                     dot.stroke()
-                    if group.needsInput || group.needsPermission {
-                        // WAITING FOR YOU — a pulsing attention ring around the point
-                        // (deliberately NOT the red error ring) + a small corner badge
-                        // that sits mostly OUTSIDE the point so its own colour shows.
-                        // Permission → amber ring + lock badge; input → orange ring +
-                        // dot badge. Not an error, just "this one wants you".
-                        let pulse = CGFloat((sin(Double(phase) * .pi / 5) + 1) * 0.5)
-                        (group.needsPermission ? NSColor.hermesYellow : NSColor.hermesOrange).setStroke()
-                        let ring = NSBezierPath(ovalIn: dotRect.insetBy(dx: -2 - pulse, dy: -2 - pulse))
-                        ring.lineWidth = 1.4
-                        ring.stroke()
-                        if group.needsPermission { drawPermissionBadge(dotRect) } else { drawInputBadge(dotRect) }
-                    }
+                    if group.needsPermission { drawPermissionBadge(dotRect) }
+                    else if group.needsInput { drawInputBadge(dotRect) }
                     dx += dotSize + innerGap
                 }
                 cx0 += w + sessionGap
