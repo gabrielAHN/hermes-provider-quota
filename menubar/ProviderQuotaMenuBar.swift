@@ -2657,8 +2657,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 .filter { !providerShownInMenuBar(kind, $0.provider) }
                 .map { Self.providerHex($0.provider).lowercased() })
             func visibleMark(_ hex: String, needsInput: Bool = false, needsPermission: Bool = false) -> SessionMark? {
-                let busy = !(needsInput || needsPermission)   // waiting sessions aren't generating
-                guard !hiddenColors.isEmpty else { return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission) }
+                let attention = needsInput || needsPermission
+                let busy = !attention   // waiting sessions aren't generating
+                // A session that NEEDS YOU (input/permission) always shows — even for a
+                // provider you've hidden — so you never miss it. Running dots still
+                // respect the eye-toggle hiding.
+                guard !attention, !hiddenColors.isEmpty else {
+                    return SessionMark(hex: hex, busy: busy, needsInput: needsInput, needsPermission: needsPermission)
+                }
                 let kept = hex.split(separator: ",").map(String.init)
                     .filter { !hiddenColors.contains($0.lowercased()) }
                 return kept.isEmpty ? nil : SessionMark(hex: kept.joined(separator: ","), busy: busy, needsInput: needsInput, needsPermission: needsPermission)
