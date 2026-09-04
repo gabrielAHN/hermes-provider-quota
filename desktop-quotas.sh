@@ -244,6 +244,19 @@ if ENDPOINT == "--activity":
         if not families:
             fam = _dot_provider(s)
             families = [fam] if fam else []
+        # Forward a WAITING-FOR-INPUT flag if the gateway reports one (e.g. a
+        # permission / approval prompt). Accept a few likely field names / a
+        # status string so the menu-bar can badge the session + wave the pet
+        # without a false positive when the gateway doesn't report it.
+        def _needs_input(sess):
+            for k in ("needs_input", "waiting_for_input", "awaiting_input",
+                      "awaiting_response", "needsInput", "input_required"):
+                v = sess.get(k)
+                if isinstance(v, bool):
+                    return v
+            st = str(sess.get("state") or sess.get("status") or "").lower()
+            return st in ("waiting", "awaiting_input", "needs_input",
+                          "input_required", "waiting_for_input", "awaiting_response")
         out.append({
             "is_active": active,
             "ended_at": s.get("ended_at"),
@@ -251,6 +264,7 @@ if ENDPOINT == "--activity":
             "billing_provider": _dot_provider(s),
             "provider": s.get("provider"),
             "providers": families,
+            "needs_input": _needs_input(s),
         })
     emit(json.dumps({"agents": 0, "status_busy": status_busy, "sessions": out}).encode())
     sys.exit(0)
