@@ -23,7 +23,11 @@ struct QuotaProvider: Codable {
 }
 
 struct QuotaWindow: Codable {
-    private static let limitReachedRemainingPercent = 5.0
+    // "Limit reached" = the window is genuinely OUT (you can't use it) → red /
+    // exhausted. A low-but-usable window (e.g. 4% weekly left) is NOT "reached" — it
+    // still has quota; it reads as low (orange, ≤15%) instead. Previously this was 5%,
+    // which flagged a still-usable 4% as "no quota".
+    private static let limitReachedRemainingPercent = 0.5
 
     let label: String
     let remainingPercent: Double?
