@@ -234,15 +234,18 @@ if ENDPOINT == "--activity":
     # store (/api/sessions) carries a human-readable `last_activity_description` per
     # session — e.g. "tool running: clarify" while an agent is asking YOU to clarify.
     # Join by session_id to detect the WAITING-FOR-YOU states without a gateway change.
-    desc_by_id = {}
+    store_by_id = {}
     try:
         _sess = _soft(get_json)("/api/sessions") or {}
         for _s in (_sess.get("sessions") or []):
             _sid = _s.get("session_id") or _s.get("id")
             if _sid:
-                desc_by_id[str(_sid)] = str(_s.get("last_activity_description") or "").lower()
+                store_by_id[str(_sid)] = _s
     except Exception:
         pass
+
+    def _store(sess):
+        return store_by_id.get(str(sess.get("session_id") or ""), {})
 
     # Tools whose "tool running: <name>" means the agent is blocked on YOU.
     # (Kept specific to avoid false positives like read_input_file / ask_database.)
@@ -267,7 +270,7 @@ if ENDPOINT == "--activity":
         if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
             return "input"
         # Else derive from the session store's activity description.
-        d = desc_by_id.get(str(sess.get("session_id") or ""), "")
+        d = str(_store(sess).get("last_activity_description") or "").lower()
         tool = d.split("tool running:", 1)[1].strip() if "tool running:" in d else ""
         if any(p in d for p in _PERM_PHRASES) or any(tool == t or tool.startswith(t) for t in _PERM_TOOLS):
             return "permission"
@@ -282,22 +285,30 @@ if ENDPOINT == "--activity":
         # the aggregate busy flag (the pet should wave, not read as working).
         if active and att == "":
             status_busy = True
-        # A session can run MULTIPLE models — resolve each to its provider family
-        # (distinct, in order) so the pet draws one dot split into a wedge per model.
+        # Colour by the LIVE model. Prefer the AUTHORITATIVE session store's current
+        # `model` (the /activity plugin's model resolution can lag — it reported
+        # anthropic while the live model was codex). Then the plugin's models list,
+        # then billing/provider. A multi-model session still splits into a wedge per
+        # distinct family.
+        st = _store(s)
+        if st.get("model") or st.get("models"):
+            model_list = ([st["model"]] if st.get("model") else []) + (st.get("models") or [])
+        else:
+            model_list = s.get("models") or []
         families = []
-        for m in (s.get("models") or []):
+        for m in model_list:
             fam = _dot_provider({"model": m})
             if fam and fam not in families:
                 families.append(fam)
         if not families:
-            fam = _dot_provider(s)
+            fam = _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s)
             families = [fam] if fam else []
         out.append({
             "is_active": active,
             "ended_at": s.get("ended_at"),
             "last_active": time.time() if active else s.get("last_active"),
-            "billing_provider": _dot_provider(s),
-            "provider": s.get("provider"),
+            "billing_provider": _dot_provider({"model": st.get("model"), "billing_provider": st.get("billing_provider")}) or _dot_provider(s),
+            "provider": st.get("provider") or s.get("provider"),
             "providers": families,
             "needs_input": att == "input",
             "needs_permission": att == "permission",
