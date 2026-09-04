@@ -269,9 +269,15 @@ if ENDPOINT == "--activity":
             return "permission"
         if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
             return "input"
-        # Else derive from the session store's activity description.
+        # Else derive from the session store's activity description. The store uses
+        # a few prefixes for the same idea ("tool running: X" / "executing tool: X" /
+        # "running tool: X"), so extract the tool name from any of them.
         d = str(_store(sess).get("last_activity_description") or "").lower()
-        tool = d.split("tool running:", 1)[1].strip() if "tool running:" in d else ""
+        tool = ""
+        for _p in ("tool running:", "executing tool:", "running tool:", "calling tool:", "tool:"):
+            if _p in d:
+                tool = d.split(_p, 1)[1].strip()
+                break
         if any(p in d for p in _PERM_PHRASES) or any(tool == t or tool.startswith(t) for t in _PERM_TOOLS):
             return "permission"
         if any(p in d for p in _INPUT_PHRASES) or any(tool == t or tool.startswith(t) for t in _INPUT_TOOLS):
