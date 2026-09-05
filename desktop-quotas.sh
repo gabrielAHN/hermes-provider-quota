@@ -247,16 +247,24 @@ if ENDPOINT == "--activity":
     def _store(sess):
         return store_by_id.get(str(sess.get("session_id") or ""), {})
 
-    # Tools whose "tool running: <name>" means the agent is blocked on YOU.
-    # (Kept specific to avoid false positives like read_input_file / ask_database.)
+    # Hermes describes a session's step as "tool running: <name>" while the tool is
+    # PENDING — blocked waiting on YOU — and "executing tool: <name>" once it's been
+    # approved and is actually running. So a PENDING tool means attention:
+    #   - an INPUT prompt (clarify / ask / …) → input
+    #   - an ACTION awaiting your APPROVAL (terminal / patch / edit / write / …) →
+    #     permission — anything that isn't a plain read-only tool.
     _INPUT_TOOLS = ("clarify", "ask_user", "askuser", "ask_followup", "ask_question",
                     "request_input", "user_input", "get_input", "elicit", "prompt_user")
-    _PERM_TOOLS = ("request_permission", "ask_permission", "approve", "approval",
-                   "permission", "confirm_action", "authorize")
+    # Read-only tools are auto-approved (a pending read is transient, not "permission").
+    _READONLY_TOOLS = ("read", "grep", "glob", "ls", "list", "search", "find", "cat",
+                       "view", "fetch", "web", "todo", "think", "plan", "notebook_read")
     _INPUT_PHRASES = ("waiting for input", "awaiting input", "needs input", "input needed",
                       "awaiting your response", "waiting for you", "awaiting user")
     _PERM_PHRASES = ("permission", "approval", "awaiting approval", "needs approval",
-                     "awaiting your approval", "permission required")
+                     "awaiting your approval", "permission required", "waiting for approval")
+
+    def _matches(tool, names):
+        return any(tool == t or tool.startswith(t) for t in names)
 
     def _attention(sess):
         # Explicit gateway flags win if the gateway ever reports them.
@@ -269,19 +277,20 @@ if ENDPOINT == "--activity":
             return "permission"
         if st in ("waiting", "awaiting_input", "needs_input", "input_required"):
             return "input"
-        # Else derive from the session store's activity description. The store uses
-        # a few prefixes for the same idea ("tool running: X" / "executing tool: X" /
-        # "running tool: X"), so extract the tool name from any of them.
+        # Else derive from the session store's activity description.
         d = str(_store(sess).get("last_activity_description") or "").lower()
-        tool = ""
-        for _p in ("tool running:", "executing tool:", "running tool:", "calling tool:", "tool:"):
-            if _p in d:
-                tool = d.split(_p, 1)[1].strip()
-                break
-        if any(p in d for p in _PERM_PHRASES) or any(tool == t or tool.startswith(t) for t in _PERM_TOOLS):
+        if any(p in d for p in _PERM_PHRASES):
             return "permission"
-        if any(p in d for p in _INPUT_PHRASES) or any(tool == t or tool.startswith(t) for t in _INPUT_TOOLS):
+        if any(p in d for p in _INPUT_PHRASES):
             return "input"
+        # PENDING tool ("tool running: X") — waiting on you. "executing tool: X" is
+        # already approved and just working, so it is deliberately NOT matched here.
+        if "tool running:" in d:
+            tool = d.split("tool running:", 1)[1].strip()
+            if _matches(tool, _INPUT_TOOLS):
+                return "input"
+            if not _matches(tool, _READONLY_TOOLS):
+                return "permission"
         return ""
 
     for s in act.get("sessions") or []:
